@@ -13,6 +13,7 @@ import pandas as pd
 
 
 PDF_DOWNLOAD_URL = "https://dart.fss.or.kr/pdf/download/pdf.do"
+PDF_DOWNLOAD_MAIN_URL = "https://dart.fss.or.kr/pdf/download/main.do"
 DART_MAIN_URL = "https://dart.fss.or.kr/dsaf001/main.do"
 STATEMENT_NAMES = ("재무상태표", "손익계산서", "현금흐름표")
 SCOPE_LABELS = {"consolidated": "연결", "separate": "별도"}
@@ -44,6 +45,7 @@ _TITLE_PATTERNS = (
 _BOUNDARY_PATTERNS = (
     re.compile(r"^(?:연결|별도)?자본변동표(?:\(?계속\)?)?$"),
     re.compile(r"^(?:연결|별도)?재무제표에대한주석$"),
+    re.compile(r"^\d+\.?(?:재무제표)?주석$"),
     re.compile(r"^주석$"),
 )
 _NUMBER_PATTERN = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
@@ -167,17 +169,22 @@ def download_filing_pdf(
 
     filename = f"DART_{receipt_number}_{document_number}.pdf"
     try:
-        # Prime DART's session before calling the file endpoint.  Some DART
-        # deployments return an empty body when the PDF URL is called cold.
+        # DART's download popup initializes the PDF download session.  Calling
+        # pdf.do directly can return HTTP 200 with an empty response body.
         landing_response = dart_module.utils.request.get(
-            url=DART_MAIN_URL,
+            url=PDF_DOWNLOAD_MAIN_URL,
             payload={
-                "rcpNo": receipt_number,
-                "dcmNo": document_number,
+                "rcp_no": receipt_number,
+                "dcm_no": document_number,
             },
+            referer=f"{DART_MAIN_URL}?rcpNo={receipt_number}",
             timeout=120,
         )
         landing_response.raise_for_status()
+        download_referer = (
+            f"{PDF_DOWNLOAD_MAIN_URL}?rcp_no={receipt_number}"
+            f"&dcm_no={document_number}"
+        )
         result = dart_module.utils.request.download(
             url=PDF_DOWNLOAD_URL,
             path=str(download_dir),
@@ -186,7 +193,7 @@ def download_filing_pdf(
                 "rcp_no": receipt_number,
                 "dcm_no": document_number,
             },
-            referer=f"{DART_MAIN_URL}?rcpNo={receipt_number}",
+            referer=download_referer,
             timeout=120,
         )
     except Exception as exc:
@@ -337,7 +344,7 @@ def _statement_regions(
             top = continuations[page_index].bottom
 
         if boundary is not None and page_index == boundary.page_index:
-            bottom = boundary.top
+            bottom = max(top, boundary.top - 0.5)
 
         if bottom - top > 5:
             regions.append(page.crop((0, top, float(page.width), bottom)))
@@ -381,8 +388,53 @@ def _is_amount_word(word: dict[str, Any]) -> bool:
     return parse_pdf_number(text) is not None or _compact_text(text) in {"-", "–", "—"}
 
 
+def _merge_wrapped_matrix_rows(matrix: list[list[str]]) -> list[list[str]]:
+    """Join one visual table row that PDF text extraction split vertically."""
+
+    if len(matrix) < 3:
+        return matrix
+
+    merged = [matrix[0]]
+    index = 1
+    while index < len(matrix):
+        row = matrix[index].copy()
+        values = row[-2:]
+        has_values = any(_compact_text(value) for value in values)
+        next_row = matrix[index + 1] if index + 1 < len(matrix) else None
+        next_has_values = bool(
+            next_row
+            and any(_compact_text(value) for value in next_row[-2:])
+        )
+        next_has_account = bool(next_row and _compact_text(next_row[0]))
+
+        if (
+            not has_values
+            and next_row is not None
+            and next_has_values
+            and not next_has_account
+        ):
+            row[-2:] = next_row[-2:]
+            index += 2
+
+            open_parentheses = row[0].count("(") - row[0].count(")")
+            if open_parentheses > 0 and index < len(matrix):
+                continuation = matrix[index]
+                continuation_has_values = any(
+                    _compact_text(value) for value in continuation[-2:]
+                )
+                if not continuation_has_values and _compact_text(continuation[0]):
+                    row[0] = f"{row[0]} {continuation[0]}".strip()
+                    index += 1
+            merged.append(row)
+            continue
+
+        merged.append(row)
+        index += 1
+    return merged
+
+
 def _region_word_matrix(region: Any) -> list[list[str]] | None:
-    """Recover a clean table by assigning words to header-derived columns."""
+    """Recover a clean table by assigning words to visible period columns."""
 
     try:
         lines = _group_page_words(region)
@@ -403,59 +455,95 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
         None,
     )
     if header_index is None:
-        return None
+        numeric_lines = [
+            [
+                word
+                for word in line
+                if _word_center(word) >= float(region.width) * 0.35
+                and _is_amount_word(word)
+            ]
+            for line in lines
+        ]
+        if sum(len(words) >= 2 for words in numeric_lines) < 2:
+            return None
 
-    header_words = lines[header_index]
-    period_starts = [
-        word
-        for word in header_words
-        if _compact_text(word["text"]).startswith("제")
-    ]
-    if len(period_starts) < 2:
-        return None
-    current_anchor = _word_center(period_starts[-2])
-    prior_anchor = _word_center(period_starts[-1])
-    period_boundary = (current_anchor + prior_anchor) / 2
-
-    note_word = next(
-        (word for word in header_words if _compact_text(word["text"]) == "주석"),
-        None,
-    )
-    account_words = [
-        word
-        for word in header_words
-        if _compact_text(word["text"]) in {"과", "목", "과목"}
-    ]
-    if not account_words:
-        return None
-    account_anchor = sum(_word_center(word) for word in account_words) / len(account_words)
-
-    if note_word is not None:
-        note_anchor = _word_center(note_word)
-        account_boundary = (account_anchor + note_anchor) / 2
-        current_floor = (note_anchor + current_anchor) / 2
-    else:
+        current_floor = float(region.width) * 0.35
+        period_boundary = float(region.width) * 0.65
+        note_word = None
         note_anchor = None
         account_boundary = None
-        current_floor = (account_anchor + current_anchor) / 2
+        header = ["과목", "당기", "전기"]
+        data_lines = lines
+    else:
+        header_words = lines[header_index]
+        period_starts = [
+            word
+            for word in header_words
+            if _compact_text(word["text"]).startswith("제")
+        ]
+        if len(period_starts) < 2:
+            return None
+        current_floor = float(period_starts[-2]["x0"])
+        period_boundary = float(period_starts[-1]["x0"])
 
-    current_header = " ".join(
-        _clean_cell(word["text"])
-        for word in header_words
-        if current_floor <= _word_center(word) < period_boundary
-    )
-    prior_header = " ".join(
-        _clean_cell(word["text"])
-        for word in header_words
-        if _word_center(word) >= period_boundary
-    )
-    header = ["과목"]
-    if note_word is not None:
-        header.append("주석")
-    header.extend([current_header or "당기", prior_header or "전기"])
+        note_word = next(
+            (
+                word
+                for word in header_words
+                if _compact_text(word["text"]) == "주석"
+            ),
+            None,
+        )
+        account_words = [
+            word
+            for word in header_words
+            if _compact_text(word["text"]) in {"과", "목", "과목"}
+        ]
+        if not account_words:
+            return None
+        account_anchor = sum(
+            _word_center(word) for word in account_words
+        ) / len(account_words)
+
+        if note_word is not None:
+            note_anchor = _word_center(note_word)
+            account_boundary = (account_anchor + note_anchor) / 2
+        else:
+            note_anchor = None
+            account_boundary = None
+
+        current_header = " ".join(
+            _clean_cell(word["text"])
+            for word in header_words
+            if current_floor <= _word_center(word) < period_boundary
+        )
+        prior_header = " ".join(
+            _clean_cell(word["text"])
+            for word in header_words
+            if _word_center(word) >= period_boundary
+        )
+        described_periods = [
+            " ".join(_clean_cell(word["text"]) for word in line)
+            for line in lines[:header_index]
+            if _compact_text(" ".join(str(word["text"]) for word in line)).startswith(
+                "제"
+            )
+            and re.search(
+                r"(?:19|20)\d{2}년",
+                _compact_text(" ".join(str(word["text"]) for word in line)),
+            )
+        ]
+        if len(described_periods) >= 2:
+            current_header, prior_header = described_periods[-2:]
+
+        header = ["과목"]
+        if note_word is not None:
+            header.append("주석")
+        header.extend([current_header or "당기", prior_header or "전기"])
+        data_lines = lines[header_index + 1 :]
 
     matrix: list[list[str]] = [header]
-    for line in lines[header_index + 1 :]:
+    for line in data_lines:
         amount_words = [
             word
             for word in line
@@ -469,9 +557,7 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
         ]
         current_word = max(current_candidates, key=_word_center, default=None)
         prior_word = max(prior_candidates, key=_word_center, default=None)
-        selected_amount_ids = {
-            id(word) for word in (current_word, prior_word) if word is not None
-        }
+        selected_amount_ids = {id(word) for word in amount_words}
 
         note_parts: list[str] = []
         account_parts: list[str] = []
@@ -509,6 +595,7 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
         row.extend([current, prior])
         matrix.append(row)
 
+    matrix = _merge_wrapped_matrix_rows(matrix)
     return matrix if _matrix_score(matrix) >= 0 else None
 
 
