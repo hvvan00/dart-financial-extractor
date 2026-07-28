@@ -388,6 +388,20 @@ def _is_amount_word(word: dict[str, Any]) -> bool:
     return parse_pdf_number(text) is not None or _compact_text(text) in {"-", "–", "—"}
 
 
+def _select_period_amount(
+    candidates: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Prefer a real amount over a farther-right blank placeholder."""
+
+    numeric_candidates = [
+        word
+        for word in candidates
+        if parse_pdf_number(_clean_cell(word["text"])) is not None
+    ]
+    selectable = numeric_candidates or list(candidates)
+    return max(selectable, key=_word_center, default=None)
+
+
 def _merge_wrapped_matrix_rows(matrix: list[list[str]]) -> list[list[str]]:
     """Join one visual table row that PDF text extraction split vertically."""
 
@@ -555,8 +569,8 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
         prior_candidates = [
             word for word in amount_words if _word_center(word) >= period_boundary
         ]
-        current_word = max(current_candidates, key=_word_center, default=None)
-        prior_word = max(prior_candidates, key=_word_center, default=None)
+        current_word = _select_period_amount(current_candidates)
+        prior_word = _select_period_amount(prior_candidates)
         selected_amount_ids = {id(word) for word in amount_words}
 
         note_parts: list[str] = []
