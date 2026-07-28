@@ -1,6 +1,10 @@
 import unittest
 
-from dart_link import InvalidDisclosureReference, parse_receipt_number
+from dart_link import (
+    InvalidDisclosureReference,
+    parse_disclosure_reference,
+    parse_receipt_number,
+)
 
 
 class ParseReceiptNumberTests(unittest.TestCase):
@@ -25,6 +29,15 @@ class ParseReceiptNumberTests(unittest.TestCase):
             ),
             "20240319000709",
         )
+
+    def test_preserves_optional_document_number_for_pdf_fallback(self):
+        reference = parse_disclosure_reference(
+            "https://dart.fss.or.kr/dsaf001/main.do"
+            "?rcpNo=20260317801285&dcmNo=11134296"
+        )
+
+        self.assertEqual(reference.receipt_number, "20260317801285")
+        self.assertEqual(reference.document_number, "11134296")
 
     def test_rejects_non_dart_url(self):
         with self.assertRaisesRegex(InvalidDisclosureReference, "공식 DART"):
@@ -53,6 +66,13 @@ class ParseReceiptNumberTests(unittest.TestCase):
             parse_receipt_number(
                 "https://dart.fss.or.kr/main.do"
                 "?rcpNo=20240319000709&rcpNo=20240319000710"
+            )
+
+    def test_rejects_invalid_document_number(self):
+        with self.assertRaisesRegex(InvalidDisclosureReference, "dcmNo"):
+            parse_disclosure_reference(
+                "https://dart.fss.or.kr/main.do"
+                "?rcpNo=20240319000709&dcmNo=not-numeric"
             )
 
 

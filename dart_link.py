@@ -3,26 +3,37 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 
 RECEIPT_NUMBER_PATTERN = re.compile(r"^\d{14}$")
+DOCUMENT_NUMBER_PATTERN = re.compile(r"^\d{5,12}$")
 
 
 class InvalidDisclosureReference(ValueError):
     """Raised when a DART URL or receipt number cannot be parsed."""
 
 
-def parse_receipt_number(value: str) -> str:
-    """Return a 14-digit DART receipt number from a number or disclosure URL.
+@dataclass(frozen=True)
+class DisclosureReference:
+    """Identifiers available in a DART disclosure reference."""
+
+    receipt_number: str
+    document_number: str | None = None
+
+
+def parse_disclosure_reference(value: str) -> DisclosureReference:
+    """Parse a DART receipt number and optional ``dcmNo`` document number.
 
     Only official DART hosts are accepted for URLs.  A URL must contain the
-    receipt number in its ``rcpNo`` query parameter.
+    receipt number in its ``rcpNo`` query parameter.  ``dcmNo`` is retained
+    when present because DART's PDF download endpoint needs it.
     """
 
     candidate = (value or "").strip()
     if RECEIPT_NUMBER_PATTERN.fullmatch(candidate):
-        return candidate
+        return DisclosureReference(receipt_number=candidate)
 
     try:
         parsed = urlparse(candidate)
@@ -61,10 +72,35 @@ def parse_receipt_number(value: str) -> str:
             "DART 공시 URL에서 유효한 14자리 rcpNo 접수번호를 찾을 수 없습니다."
         )
 
-    return receipt_values[0]
+    document_values = [
+        document
+        for key, values in query.items()
+        if key.lower() == "dcmno"
+        for document in values
+    ]
+    if document_values and (
+        len(document_values) != 1
+        or not DOCUMENT_NUMBER_PATTERN.fullmatch(document_values[0])
+    ):
+        raise InvalidDisclosureReference(
+            "DART 공시 URL의 dcmNo 문서번호 형식이 올바르지 않습니다."
+        )
+
+    return DisclosureReference(
+        receipt_number=receipt_values[0],
+        document_number=document_values[0] if document_values else None,
+    )
+
+
+def parse_receipt_number(value: str) -> str:
+    """Return only the 14-digit receipt number from a DART reference."""
+
+    return parse_disclosure_reference(value).receipt_number
 
 
 __all__ = [
+    "DisclosureReference",
     "InvalidDisclosureReference",
+    "parse_disclosure_reference",
     "parse_receipt_number",
 ]

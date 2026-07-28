@@ -1,4 +1,4 @@
-"""Extract exactly three financial statements from a DART filing XBRL."""
+"""Extract exactly three clean financial statements from a DART filing."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import math
 import numbers
 import os
+import re
 import sys
 import tempfile
 import unicodedata
@@ -14,10 +15,16 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from dart_link import InvalidDisclosureReference, parse_receipt_number
+from dart_link import InvalidDisclosureReference, parse_disclosure_reference
+from pdf_financials import (
+    PdfExtractionError,
+    download_filing_pdf,
+    extract_pdf_statements,
+    resolve_document_number,
+)
 
 
 STATEMENT_SPECS = (
@@ -73,9 +80,15 @@ def _import_dart_fss() -> Any:
 
 def _looks_like_missing_xbrl(exc: Exception) -> bool:
     message = str(exc).lower()
-    return isinstance(exc, FileNotFoundError) or exc.__class__.__name__ == "NoDataReceived" or (
-        ("xbrl" in message and "not found" in message)
+    return (
+        isinstance(exc, FileNotFoundError)
+        or exc.__class__.__name__ == "NoDataReceived"
+        or ("xbrl" in message and "not found" in message)
         or "no data received" in message
+        or "조회된 데이타가 없습니다" in message
+        or "조회된 데이터가 없습니다" in message
+        or "파일이 존재하지 않습니다" in message
+        or "target does not exist" in message
     )
 
 
@@ -126,19 +139,21 @@ def _first_table(value: Any) -> Any | None:
     return value
 
 
-def _table_to_dataframe(table: Any) -> pd.DataFrame | None:
+def _table_to_dataframe(table: Any, *, separate: bool) -> pd.DataFrame | None:
     if table is None:
         return None
     frame = table.to_DataFrame(
         lang="ko",
-        show_abstract=False,
-        show_class=True,
-        show_concept=True,
+        label="Separate" if separate else "Consolidated",
+        show_abstract=True,
+        show_class=False,
+        show_concept=False,
         separator=False,
     )
     if frame is None or frame.empty:
         return None
-    return flatten_dataframe_columns(frame)
+    simplified = simplify_statement_dataframe(frame)
+    return simplified if not simplified.empty else None
 
 
 def _extract_for_scope(
@@ -152,7 +167,7 @@ def _extract_for_scope(
     for statement_name, method_name in STATEMENT_SPECS:
         method = getattr(xbrl, method_name)
         table = _first_table(method(separate=separate))
-        frame = _table_to_dataframe(table)
+        frame = _table_to_dataframe(table, separate=separate)
         if frame is None:
             missing.append(statement_name)
         else:
@@ -243,6 +258,194 @@ def flatten_dataframe_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return flattened
 
 
+_DATE_PATTERN = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})(?:일)?(?!\d)"
+)
+_COMPACT_DATE_PATTERN = re.compile(r"(?<!\d)((?:19|20)\d{6})(?!\d)")
+_ITEM_COLUMN_NAMES = {
+    "labelko",
+    "계정",
+    "계정과목",
+    "계정명",
+    "과목",
+    "항목",
+}
+_METADATA_COLUMN_NAMES = {
+    "concept",
+    "conceptid",
+    "labelen",
+    "class",
+    "주석",
+    "note",
+    "notes",
+}
+
+
+def _column_parts(column: Any) -> list[str]:
+    values = column if isinstance(column, tuple) else (column,)
+    parts: list[str] = []
+    for value in values:
+        nested_values = value if isinstance(value, tuple) else (value,)
+        for nested_value in nested_values:
+            text = _column_part_text(nested_value)
+            if text and text not in parts:
+                parts.append(text)
+    return parts
+
+
+def _normalized_header_part(value: str) -> str:
+    return re.sub(r"[\s_\-]+", "", value).lower()
+
+
+def _item_column_score(column: Any) -> int:
+    normalized = [_normalized_header_part(part) for part in _column_parts(column)]
+    if "labelko" in normalized:
+        return 100
+    if any(part in {"과목", "항목", "계정과목", "계정명"} for part in normalized):
+        return 90
+    if "계정" in normalized:
+        return 80
+    return 0
+
+
+def _is_metadata_column(column: Any) -> bool:
+    normalized = [_normalized_header_part(part) for part in _column_parts(column)]
+    return any(
+        part in _METADATA_COLUMN_NAMES
+        or part.startswith("class")
+        or part.startswith("conceptid")
+        or part.startswith("주석")
+        or part.startswith("note")
+        for part in normalized
+    )
+
+
+def _as_excel_number(value: Any) -> int | float | Any:
+    if value is None or isinstance(value, bool):
+        return "" if value is None else value
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, numbers.Number):
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    text = " ".join(str(value).replace("\u00a0", " ").split())
+    if not text or text in {"-", "–", "—"}:
+        return ""
+
+    negative = text.startswith("(") and text.endswith(")")
+    numeric_text = text[1:-1] if negative else text
+    numeric_text = numeric_text.replace(",", "")
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", numeric_text):
+        number: int | float
+        number = float(numeric_text) if "." in numeric_text else int(numeric_text)
+        return -number if negative else number
+    return text
+
+
+def _series_has_numeric_value(series: pd.Series) -> bool:
+    return any(
+        isinstance(converted := _as_excel_number(value), numbers.Number)
+        and not isinstance(converted, bool)
+        for value in series
+    )
+
+
+def _period_header(column: Any) -> str:
+    parts = _column_parts(column)
+    joined = " ".join(parts)
+    dates = [
+        f"{year}-{int(month):02d}-{int(day):02d}"
+        for year, month, day in _DATE_PATTERN.findall(joined)
+    ]
+    dates.extend(
+        f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        for date in _COMPACT_DATE_PATTERN.findall(joined)
+    )
+    dates = list(dict.fromkeys(dates))
+    if dates:
+        return dates[0] if len(dates) == 1 else f"{dates[0]} ~ {dates[-1]}"
+
+    preferred_markers = ("당기", "전기", "분기", "반기", "누적", "기말", "연도")
+    for part in reversed(parts):
+        compact = _normalized_header_part(part)
+        if any(marker in compact for marker in preferred_markers):
+            return part
+
+    for part in reversed(parts):
+        compact = _normalized_header_part(part)
+        if (
+            compact not in _METADATA_COLUMN_NAMES
+            and compact not in _ITEM_COLUMN_NAMES
+            and "unit:" not in part.lower()
+            and "재무상태표" not in compact
+            and "손익계산서" not in compact
+            and "현금흐름표" not in compact
+        ):
+            return part
+    return "금액"
+
+
+def _clean_item_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = " ".join(str(value).replace("\u00a0", " ").split())
+    return re.sub(r"\s*\[abstract\]\s*$", "", text, flags=re.IGNORECASE)
+
+
+def simplify_statement_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep one Korean item column and only period columns containing amounts."""
+
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    columns = frame.columns.to_list()
+    item_index = max(
+        range(len(columns)),
+        key=lambda index: _item_column_score(columns[index]),
+        default=0,
+    )
+    if _item_column_score(columns[item_index]) == 0:
+        item_index = 0
+
+    amount_indices = [
+        index
+        for index, column in enumerate(columns)
+        if index != item_index
+        and not _is_metadata_column(column)
+        and _series_has_numeric_value(frame.iloc[:, index])
+    ]
+    if not amount_indices:
+        return pd.DataFrame()
+
+    output_columns = ["항목"] + [
+        _period_header(columns[index]) for index in amount_indices
+    ]
+    output_columns = _deduplicate_headers(output_columns)
+
+    series = [frame.iloc[:, item_index].map(_clean_item_value)]
+    series.extend(
+        frame.iloc[:, index].map(_as_excel_number) for index in amount_indices
+    )
+    simplified = pd.concat(series, axis=1)
+    simplified.columns = output_columns
+
+    populated_rows = simplified.apply(
+        lambda row: any(value not in {"", None} for value in row),
+        axis=1,
+    )
+    return simplified.loc[populated_rows].reset_index(drop=True)
+
+
 def _display_width(value: Any) -> int:
     text = "" if value is None else str(value)
     return sum(
@@ -255,24 +458,39 @@ def format_worksheet(worksheet: Any) -> None:
     """Apply the small, deterministic formatting set required for outputs."""
 
     worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = worksheet.dimensions
+    worksheet.sheet_view.showGridLines = False
 
     for cell in worksheet[1]:
         cell.font = Font(bold=True)
+        cell.fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
 
     for row in worksheet.iter_rows(min_row=2):
+        has_number = False
         for cell in row:
             value = cell.value
             if isinstance(value, numbers.Number) and not isinstance(value, bool):
                 if isinstance(value, float) and not math.isfinite(value):
                     continue
-                cell.number_format = "#,##0.00;[Red]-#,##0.00"
+                cell.number_format = "#,##0;[Red](#,##0);-"
+                cell.alignment = Alignment(horizontal="right")
+                has_number = True
+            elif cell.column == 1:
+                cell.alignment = Alignment(horizontal="left")
+        if not has_number and row[0].value:
+            row[0].font = Font(bold=True)
 
     for column_index, column_cells in enumerate(worksheet.columns, start=1):
         content_width = max((_display_width(cell.value) for cell in column_cells), default=0)
+        minimum_width = 24 if column_index == 1 else 16
+        maximum_width = 45 if column_index == 1 else 24
         worksheet.column_dimensions[get_column_letter(column_index)].width = min(
-            max(content_width + 2, 10),
-            45,
+            max(content_width + 2, minimum_width),
+            maximum_width,
         )
 
 
@@ -300,7 +518,16 @@ def export_statements(
             "내보낼 재무제표는 정확히 재무상태표, 손익계산서, 현금흐름표여야 합니다."
         )
 
-    ordered_statements = {name: statements[name] for name in STATEMENT_NAMES}
+    ordered_statements = {
+        name: simplify_statement_dataframe(statements[name])
+        for name in STATEMENT_NAMES
+    }
+    empty = [name for name, frame in ordered_statements.items() if frame.empty]
+    if empty:
+        raise ValueError(
+            "항목과 기간별 금액으로 정리할 수 없는 재무제표가 있습니다: "
+            + ", ".join(empty)
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if output_mode == "single":
@@ -327,17 +554,41 @@ def run(
     output_dir: Path = Path("output"),
     environ: Mapping[str, str] | None = None,
     dart_module: Any | None = None,
-) -> tuple[list[Path], str, str]:
-    """Run the extraction pipeline and return paths, selected scope, and receipt."""
+) -> tuple[list[Path], str, str, str]:
+    """Run extraction and return paths, selected scope, receipt, and source."""
 
-    receipt_number = parse_receipt_number(disclosure)
+    reference = parse_disclosure_reference(disclosure)
+    receipt_number = reference.receipt_number
     api_key = require_api_key(environ)
     dart = _import_dart_fss() if dart_module is None else dart_module
     dart.set_api_key(api_key=api_key)
 
-    with tempfile.TemporaryDirectory(prefix="dart-xbrl-") as temp_dir:
-        xbrl = load_xbrl(receipt_number, Path(temp_dir), dart)
-        statements, selected_scope = extract_statements(xbrl, scope)
+    with tempfile.TemporaryDirectory(prefix="dart-financials-") as temp_dir:
+        temp_path = Path(temp_dir)
+        try:
+            xbrl = load_xbrl(receipt_number, temp_path, dart)
+        except MissingXbrlError as xbrl_error:
+            try:
+                document_number = reference.document_number or resolve_document_number(
+                    receipt_number,
+                    dart,
+                )
+                pdf_path = download_filing_pdf(
+                    receipt_number,
+                    document_number,
+                    temp_path,
+                    dart,
+                )
+                statements, selected_scope = extract_pdf_statements(pdf_path, scope)
+            except PdfExtractionError as pdf_error:
+                raise FinancialExtractionError(
+                    f"{xbrl_error} PDF 대체 추출도 실패했습니다: {pdf_error}"
+                ) from pdf_error
+            source = "PDF"
+        else:
+            statements, selected_scope = extract_statements(xbrl, scope)
+            source = "XBRL"
+
         paths = export_statements(
             statements,
             receipt_number=receipt_number,
@@ -345,12 +596,15 @@ def run(
             output_dir=output_dir,
         )
 
-    return paths, selected_scope, receipt_number
+    return paths, selected_scope, receipt_number, source
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DART 공시 XBRL에서 재무제표 3종을 Excel로 추출합니다."
+        description=(
+            "DART 공시 XBRL에서 재무제표 3종을 추출하고, "
+            "XBRL이 없으면 공시 PDF를 사용합니다."
+        )
     )
     parser.add_argument("disclosure", help="DART 공시 URL 또는 14자리 접수번호")
     parser.add_argument(
@@ -377,7 +631,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     try:
-        paths, selected_scope, receipt_number = run(
+        paths, selected_scope, receipt_number, source = run(
             args.disclosure,
             scope=args.scope,
             output_mode=args.output_mode,
@@ -392,6 +646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(f"접수번호: {receipt_number}")
+    print(f"추출 원본: {source}")
     print(f"재무제표 범위: {SCOPE_LABELS[selected_scope]}")
     for path in paths:
         print(f"생성 완료: {path}")
