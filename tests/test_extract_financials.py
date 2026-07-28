@@ -8,6 +8,8 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from extract_financials import (
+    FilingMetadata,
+    FinancialExtractionError,
     MissingApiKeyError,
     MissingStatementError,
     MissingXbrlError,
@@ -16,7 +18,9 @@ from extract_financials import (
     extract_statements,
     flatten_dataframe_columns,
     load_xbrl,
+    parse_filing_metadata_html,
     require_api_key,
+    resolve_filing_metadata,
     run,
     simplify_statement_dataframe,
 )
@@ -91,6 +95,66 @@ class ApiKeyTests(unittest.TestCase):
             require_api_key({"DART_API_KEY": " secret-value "}),
             "secret-value",
         )
+
+
+class FilingMetadataTests(unittest.TestCase):
+    def test_parses_dart_slash_title(self):
+        metadata = parse_filing_metadata_html(
+            "<html><title>펀진/사업보고서/2026.03.31</title></html>"
+        )
+
+        self.assertEqual(metadata.company_name, "펀진")
+        self.assertEqual(metadata.report_type, "사업보고서")
+        self.assertEqual(metadata.year_month, "2026.03")
+        self.assertEqual(metadata.filename_stem, "펀진_사업보고서_2026.03")
+
+    def test_parses_bracket_pdf_style_title(self):
+        metadata = parse_filing_metadata_html(
+            "<title>[테스트 회사] 반기보고서(2025.08.14)</title>"
+        )
+
+        self.assertEqual(
+            metadata.filename_stem,
+            "테스트 회사_반기보고서_2025.08",
+        )
+
+    def test_invalid_filename_characters_are_replaced(self):
+        metadata = FilingMetadata(
+            company_name="테스트:회사",
+            report_type="분기보고서",
+            year_month="2025.11",
+        )
+
+        self.assertEqual(
+            metadata.filename_stem,
+            "테스트_회사_분기보고서_2025.11",
+        )
+
+    def test_missing_filename_metadata_has_clear_error(self):
+        with self.assertRaisesRegex(
+            FinancialExtractionError,
+            "회사명, 보고서 종류, 연월",
+        ):
+            parse_filing_metadata_html("<title>DART 전자공시</title>")
+
+    def test_resolves_metadata_from_disclosure_page(self):
+        response = SimpleNamespace(
+            text="<title>펀진/사업보고서/2026.03.31</title>",
+            raise_for_status=lambda: None,
+        )
+        calls = []
+        dart = SimpleNamespace(
+            utils=SimpleNamespace(
+                request=SimpleNamespace(
+                    get=lambda **kwargs: calls.append(kwargs) or response
+                )
+            )
+        )
+
+        metadata = resolve_filing_metadata("20260331004320", dart)
+
+        self.assertEqual(metadata.filename_stem, "펀진_사업보고서_2026.03")
+        self.assertEqual(calls[0]["payload"], {"rcpNo": "20260331004320"})
 
 
 class XbrlLoadingTests(unittest.TestCase):
@@ -273,12 +337,13 @@ class ExcelOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = export_statements(
                 self.statements,
-                receipt_number="20240319000709",
+                metadata=FilingMetadata("펀진", "사업보고서", "2026.03"),
                 output_mode="single",
                 output_dir=Path(temp_dir),
             )
 
             self.assertEqual(len(paths), 1)
+            self.assertEqual(paths[0].name, "펀진_사업보고서_2026.03.xlsx")
             workbook = load_workbook(paths[0])
             self.assertEqual(workbook.sheetnames, list(STATEMENT_NAMES))
             for worksheet in workbook.worksheets:
@@ -298,7 +363,7 @@ class ExcelOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = export_statements(
                 self.statements,
-                receipt_number="20240319000709",
+                metadata=FilingMetadata("펀진", "사업보고서", "2026.03"),
                 output_mode="separate",
                 output_dir=Path(temp_dir),
             )
@@ -306,6 +371,10 @@ class ExcelOutputTests(unittest.TestCase):
             self.assertEqual(len(paths), 3)
             self.assertEqual(len(list(Path(temp_dir).glob("*.xlsx"))), 3)
             for path, statement_name in zip(paths, STATEMENT_NAMES):
+                self.assertEqual(
+                    path.name,
+                    f"펀진_사업보고서_2026.03_{statement_name}.xlsx",
+                )
                 workbook = load_workbook(path)
                 self.assertEqual(workbook.sheetnames, [statement_name])
 
@@ -340,6 +409,14 @@ class PipelineFallbackTests(unittest.TestCase):
                     "extract_financials.extract_pdf_statements",
                     return_value=(statements, "consolidated"),
                 ),
+                patch(
+                    "extract_financials.resolve_filing_metadata",
+                    return_value=FilingMetadata(
+                        "펀진",
+                        "사업보고서",
+                        "2026.03",
+                    ),
+                ),
             ):
                 paths, selected_scope, receipt_number, source = run(
                     "20260317801285",
@@ -352,6 +429,7 @@ class PipelineFallbackTests(unittest.TestCase):
         self.assertEqual(selected_scope, "consolidated")
         self.assertEqual(receipt_number, "20260317801285")
         self.assertEqual(source, "PDF")
+        self.assertEqual(paths[0].name, "펀진_사업보고서_2026.03.xlsx")
 
 
 if __name__ == "__main__":
