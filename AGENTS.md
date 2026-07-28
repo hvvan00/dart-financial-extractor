@@ -20,6 +20,9 @@
   complete separate set without mixing scopes.
 - Single output must contain exactly `재무상태표`, `손익계산서`, and
   `현금흐름표` sheets. Separate output must contain exactly three files.
+- Name single outputs `회사명_보고서종류_YYYY.MM.xlsx`. For separate mode,
+  append the Korean statement name before `.xlsx`. Report type must be one of
+  `사업보고서`, `반기보고서`, or `분기보고서`.
 - Each exported statement must contain only one Korean `항목` column followed
   by period amount columns. Exclude concept IDs, English labels, class/category
   columns, and note-reference columns from user-facing Excel files.

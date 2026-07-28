@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import math
 import numbers
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unicodedata
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from openpyxl.utils import get_column_letter
 
 from dart_link import InvalidDisclosureReference, parse_disclosure_reference
 from pdf_financials import (
+    DART_MAIN_URL,
     PdfExtractionError,
     download_filing_pdf,
     extract_pdf_statements,
@@ -37,6 +40,9 @@ SCOPE_LABELS = {
     "consolidated": "연결",
     "separate": "별도",
 }
+REPORT_TYPES = ("사업보고서", "반기보고서", "분기보고서")
+_INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 
 class FinancialExtractionError(RuntimeError):
@@ -53,6 +59,96 @@ class MissingXbrlError(FinancialExtractionError):
 
 class MissingStatementError(FinancialExtractionError):
     """Raised when one or more required statements cannot be extracted."""
+
+
+@dataclass(frozen=True)
+class FilingMetadata:
+    """The disclosure metadata used only to create a readable output filename."""
+
+    company_name: str
+    report_type: str
+    year_month: str
+
+    @property
+    def filename_stem(self) -> str:
+        company = _safe_filename_part(self.company_name)
+        return f"{company}_{self.report_type}_{self.year_month}"
+
+
+def _safe_filename_part(value: str) -> str:
+    cleaned = _INVALID_FILENAME_CHARACTERS.sub("_", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    cleaned = re.sub(r"_+", "_", cleaned)
+    if not cleaned:
+        raise FinancialExtractionError("회사명을 안전한 파일명으로 만들 수 없습니다.")
+    return cleaned
+
+
+def parse_filing_metadata_html(html_text: str) -> FilingMetadata:
+    """Read company, report type, and filing year/month from a DART page title."""
+
+    title_match = re.search(
+        r"<title[^>]*>(?P<title>.*?)</title>",
+        html_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    title = title_match.group("title") if title_match else html_text
+    title = html.unescape(_HTML_TAG_PATTERN.sub("", title))
+    title = " ".join(title.replace("\u00a0", " ").split())
+
+    report_pattern = "|".join(REPORT_TYPES)
+    date_pattern = (
+        r"(?P<year>(?:19|20)\d{2})[.\-/년]\s*"
+        r"(?P<month>\d{1,2})[.\-/월]\s*(?:\d{1,2}일?)?"
+    )
+    patterns = (
+        re.compile(
+            rf"(?P<company>.+?)\s*/\s*"
+            rf"(?P<report>{report_pattern})\s*/\s*{date_pattern}"
+        ),
+        re.compile(
+            rf"\[(?P<company>[^\]]+)\]\s*"
+            rf"(?P<report>{report_pattern})\s*\(\s*{date_pattern}\s*\)"
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.search(title)
+        if not match:
+            continue
+        company_name = match.group("company").strip()
+        report_type = match.group("report")
+        month = int(match.group("month"))
+        if not 1 <= month <= 12:
+            break
+        return FilingMetadata(
+            company_name=company_name,
+            report_type=report_type,
+            year_month=f"{match.group('year')}.{month:02d}",
+        )
+
+    raise FinancialExtractionError(
+        "공시 페이지에서 회사명, 보고서 종류, 연월을 찾을 수 없습니다."
+    )
+
+
+def resolve_filing_metadata(
+    receipt_number: str,
+    dart_module: Any,
+) -> FilingMetadata:
+    """Download the DART disclosure page and resolve output filename metadata."""
+
+    try:
+        response = dart_module.utils.request.get(
+            url=DART_MAIN_URL,
+            payload={"rcpNo": receipt_number},
+            timeout=120,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        raise FinancialExtractionError(
+            f"공시 파일명 정보를 확인하지 못했습니다: {exc}"
+        ) from exc
+    return parse_filing_metadata_html(response.text)
 
 
 def require_api_key(environ: Mapping[str, str] | None = None) -> str:
@@ -505,7 +601,7 @@ def _write_workbook(path: Path, sheets: Mapping[str, pd.DataFrame]) -> None:
 def export_statements(
     statements: Mapping[str, pd.DataFrame],
     *,
-    receipt_number: str,
+    metadata: FilingMetadata,
     output_mode: str,
     output_dir: Path,
 ) -> list[Path]:
@@ -529,16 +625,17 @@ def export_statements(
             + ", ".join(empty)
         )
     output_dir.mkdir(parents=True, exist_ok=True)
+    filename_stem = metadata.filename_stem
 
     if output_mode == "single":
-        workbook_path = output_dir / f"DART_{receipt_number}_재무제표.xlsx"
+        workbook_path = output_dir / f"{filename_stem}.xlsx"
         _write_workbook(workbook_path, ordered_statements)
         return [workbook_path]
 
     if output_mode == "separate":
         paths: list[Path] = []
         for statement_name, frame in ordered_statements.items():
-            workbook_path = output_dir / f"DART_{receipt_number}_{statement_name}.xlsx"
+            workbook_path = output_dir / f"{filename_stem}_{statement_name}.xlsx"
             _write_workbook(workbook_path, {statement_name: frame})
             paths.append(workbook_path)
         return paths
@@ -562,6 +659,7 @@ def run(
     api_key = require_api_key(environ)
     dart = _import_dart_fss() if dart_module is None else dart_module
     dart.set_api_key(api_key=api_key)
+    metadata = resolve_filing_metadata(receipt_number, dart)
 
     with tempfile.TemporaryDirectory(prefix="dart-financials-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -591,7 +689,7 @@ def run(
 
         paths = export_statements(
             statements,
-            receipt_number=receipt_number,
+            metadata=metadata,
             output_mode=output_mode,
             output_dir=output_dir,
         )
