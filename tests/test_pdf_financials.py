@@ -147,7 +147,7 @@ class PdfNumberTests(unittest.TestCase):
         self.assertEqual(frame.iloc[0, 0], "자산")
         self.assertEqual(frame.iloc[1, 2], 1_234)
 
-    def test_merged_amount_subcolumns_stay_out_of_item_labels(self):
+    def test_merged_amount_subcolumns_prefer_numbers_over_dash_placeholders(self):
         words = [
             pdf_word("과", 52, 61, 10),
             pdf_word("목", 133, 142, 10),
@@ -164,7 +164,9 @@ class PdfNumberTests(unittest.TestCase):
             pdf_word("1.", 84, 92, 50),
             pdf_word("현금및현금성자산", 95, 167, 50),
             pdf_word("927,476,242", 249, 302, 50),
+            pdf_word("-", 371, 376, 50),
             pdf_word("7,744,956,586", 402, 463, 50),
+            pdf_word("-", 532, 537, 50),
         ]
 
         matrix = _region_word_matrix(WordRegion(words))
@@ -173,6 +175,9 @@ class PdfNumberTests(unittest.TestCase):
         self.assertEqual(frame.iloc[0, 0], "Ⅰ. 유동자산")
         self.assertEqual(frame.iloc[0, 1], 3_934_983_786)
         self.assertEqual(frame.iloc[0, 2], 9_922_086_349)
+        self.assertEqual(frame.iloc[1, 0], "1. 현금및현금성자산")
+        self.assertEqual(frame.iloc[1, 1], 927_476_242)
+        self.assertEqual(frame.iloc[1, 2], 7_744_956_586)
 
     def test_headerless_continuation_page_uses_same_two_period_layout(self):
         words = [
