@@ -1,0 +1,69 @@
+name: DART 재무제표 Excel 추출
+
+on:
+  workflow_dispatch:
+    inputs:
+      disclosure:
+        description: "DART 공시 URL 또는 14자리 접수번호"
+        required: true
+        type: string
+      statement_scope:
+        description: "재무제표 범위"
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - consolidated
+          - separate
+      output_mode:
+        description: "Excel 출력 방식"
+        required: true
+        default: single
+        type: choice
+        options:
+          - single
+          - separate
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 재무제표 추출
+        env:
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
+          DISCLOSURE_INPUT: ${{ inputs.disclosure }}
+          STATEMENT_SCOPE: ${{ inputs.statement_scope }}
+          OUTPUT_MODE: ${{ inputs.output_mode }}
+        run: >-
+          python extract_financials.py "$DISCLOSURE_INPUT"
+          --scope "$STATEMENT_SCOPE"
+          --output-mode "$OUTPUT_MODE"
+          --output-dir output
+
+      - name: Excel 결과 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: dart-financial-statements-${{ github.run_id }}
+          path: output/*.xlsx
+          if-no-files-found: error
+          retention-days: 7
