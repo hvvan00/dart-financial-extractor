@@ -489,10 +489,145 @@ class ExcelOutputTests(unittest.TestCase):
             self.assertEqual(worksheet["A4"].fill.fgColor.rgb[-6:], "06A39F")
             self.assertEqual(worksheet["A4"].font.color.rgb[-6:], "FFFFFF")
             self.assertNotIn("[Red]", worksheet["B4"].number_format)
+            self.assertEqual(worksheet["A3"].value, "유동자산")
+            self.assertEqual(worksheet["A4"].value, "당좌자산")
+            self.assertEqual(worksheet["A5"].value, "현금및현금성자산")
+            self.assertEqual(worksheet["A6"].value, "└ 대손충당금")
             self.assertEqual(worksheet["A5"].alignment.indent, 2)
             self.assertEqual(worksheet["A6"].alignment.indent, 3)
             self.assertTrue(worksheet["A7"].font.bold)
             self.assertEqual(worksheet["A7"].border.top.style, "medium")
+
+    def test_removes_partial_source_numbering_and_keeps_true_siblings_aligned(self):
+        intangible_frame = pd.DataFrame(
+            [
+                ["(3) 무형자산(주석5)", 221, 232, 288, 241],
+                ["1. 특허권", 128, 125, "", ""],
+                ["정부보조금", -2, "", "", ""],
+                ["산업재산권", "", "", 200, 169],
+                ["2. 소프트웨어", 377, 157, 89, ""],
+                ["정부보조금", -281, -50, "", ""],
+                ["개발비", "", "", "", 73],
+            ],
+            columns=["항목", "2025년", "2024년", "2023년", "2022년"],
+        )
+        statements = {
+            name: intangible_frame.copy() for name in STATEMENT_NAMES
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = export_statements(
+                statements,
+                metadata=FilingMetadata("테스트", "감사보고서", "2022-2025"),
+                output_mode="single",
+                output_dir=Path(temp_dir),
+            )[0]
+            worksheet = load_workbook(path)["재무상태표"]
+
+            self.assertEqual(
+                [worksheet[f"A{row}"].value for row in range(2, 9)],
+                [
+                    "무형자산(주석5)",
+                    "특허권",
+                    "└ 정부보조금",
+                    "산업재산권",
+                    "소프트웨어",
+                    "└ 정부보조금",
+                    "개발비",
+                ],
+            )
+            self.assertEqual(
+                [worksheet[f"A{row}"].alignment.indent for row in range(3, 9)],
+                [2, 3, 2, 2, 3, 2],
+            )
+
+    def test_normalizes_subgroups_across_income_and_cash_flow_statements(self):
+        income_frame = pd.DataFrame(
+            [
+                ["Ⅱ. 매출원가", 80, 70],
+                ["1. 제품매출원가", 50, 40],
+                ["가. 기초제품재고액", 10, 8],
+                ["(2) 상품매출원가", 30, 30],
+                ["가. 기초상품재고액", 6, 5],
+            ],
+            columns=["항목", "2025년", "2024년"],
+        )
+        cash_flow_frame = pd.DataFrame(
+            [
+                ["Ⅰ. 영업활동으로 인한 현금흐름", 100, 90],
+                ["1. 당기순이익(손실)", 30, 20],
+                ["2. 현금의 유출이 없는 비용등의 가산", 40, 35],
+                ["가. 퇴직급여", 5, 4],
+                ["3. 영업활동으로 인한 자산·부채의 변동", -10, -8],
+                ["가. 매출채권의 증가", -3, -2],
+                ["Ⅱ. 투자활동으로 인한 현금흐름", -20, -15],
+                ["1. 투자활동으로 인한 현금유입액", 10, 9],
+                ["가. 단기금융상품의 감소", 10, 9],
+                ["2. 투자활동으로 인한 현금유출액", -30, -24],
+                ["가. 단기금융상품의 증가", -30, -24],
+            ],
+            columns=["항목", "2025년", "2024년"],
+        )
+        statements = {
+            "재무상태표": income_frame.copy(),
+            "손익계산서": income_frame,
+            "현금흐름표": cash_flow_frame,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = export_statements(
+                statements,
+                metadata=FilingMetadata("테스트", "감사보고서", "2024-2025"),
+                output_mode="single",
+                output_dir=Path(temp_dir),
+            )[0]
+            workbook = load_workbook(path)
+            income_sheet = workbook["손익계산서"]
+            cash_flow_sheet = workbook["현금흐름표"]
+
+            self.assertEqual(
+                [income_sheet[f"A{row}"].value for row in range(2, 7)],
+                [
+                    "매출원가",
+                    "제품매출원가",
+                    "기초제품재고액",
+                    "상품매출원가",
+                    "기초상품재고액",
+                ],
+            )
+            for row in (3, 5):
+                self.assertEqual(
+                    income_sheet[f"A{row}"].fill.fgColor.rgb[-6:],
+                    "06A39F",
+                )
+                self.assertEqual(income_sheet[f"A{row}"].alignment.indent, 1)
+            for row in (4, 6):
+                self.assertEqual(income_sheet[f"A{row}"].alignment.indent, 2)
+
+            self.assertEqual(
+                [cash_flow_sheet[f"A{row}"].value for row in range(2, 13)],
+                [
+                    "영업활동으로 인한 현금흐름",
+                    "당기순이익(손실)",
+                    "현금의 유출이 없는 비용등의 가산",
+                    "퇴직급여",
+                    "영업활동으로 인한 자산·부채의 변동",
+                    "매출채권의 증가",
+                    "투자활동으로 인한 현금흐름",
+                    "투자활동으로 인한 현금유입액",
+                    "단기금융상품의 감소",
+                    "투자활동으로 인한 현금유출액",
+                    "단기금융상품의 증가",
+                ],
+            )
+            for row in (3, 4, 6, 9, 11):
+                self.assertEqual(
+                    cash_flow_sheet[f"A{row}"].fill.fgColor.rgb[-6:],
+                    "06A39F",
+                )
+                self.assertEqual(cash_flow_sheet[f"A{row}"].alignment.indent, 1)
+            for row in (5, 7, 10, 12):
+                self.assertEqual(cash_flow_sheet[f"A{row}"].alignment.indent, 2)
 
     def test_separate_mode_creates_exactly_three_individual_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
