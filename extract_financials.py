@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from dart_link import InvalidDisclosureReference, parse_disclosure_reference
@@ -48,6 +48,10 @@ _INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _DART_CONNECTION_ATTEMPTS = 3
 _DART_RETRY_DELAYS = (5, 15)
+_HIGHLIGHT_DARK = "006074"
+_HIGHLIGHT_MEDIUM = "008187"
+_HIGHLIGHT_ACCENT = "06A39F"
+_HIGHLIGHT_TEXT = "FFFFFF"
 
 
 class FinancialExtractionError(RuntimeError):
@@ -742,9 +746,78 @@ _LEADING_ITEM_NUMBER_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 _TRAILING_NOTE_REFERENCE_PATTERN = re.compile(
-    r"\s*[\(\[]\s*(?:주석|notes?)\s*[\d,\-~·ㆍ\s]+\s*[\)\]]\s*$",
+    r"\s*[\(\[]\s*(?:주석|notes?)\s*[\d,\-~·ㆍ과와및\s]+\s*[\)\]]\s*$",
     flags=re.IGNORECASE,
 )
+_ITEM_KEY_ALIASES = {
+    "국고보조금": "정부보조금",
+    "제품매출액": "제품매출",
+    "상품매출액": "상품매출",
+    "세금과공과": "세금과공과금",
+    "영업이익": "영업손익",
+    "영업손실": "영업손익",
+    "영업이익(손실)": "영업손익",
+    "법인세차감전순이익": "법인세차감전순손익",
+    "법인세차감전순손실": "법인세차감전순손익",
+    "법인세차감전순이익(손실)": "법인세차감전순손익",
+    "당기순이익": "당기순손익",
+    "당기순손실": "당기순손익",
+    "당기순이익(손실)": "당기순손익",
+    "현금의유출이없는비용등의가": "현금의유출이없는비용등의가산",
+    "현금의유입이없는수익등의차": "현금의유입이없는수익등의차감",
+    "영업활동으로인한자산부채의변": "영업활동으로인한자산부채의변동",
+    "영업활동으로인한자산부채의": "영업활동으로인한자산부채의변동",
+    "매출채권의증가": "매출채권의증가(감소)",
+    "매출채권의감소(증가)": "매출채권의증가(감소)",
+    "선급금의증가": "선급금의증가(감소)",
+    "선급금의감소(증가)": "선급금의증가(감소)",
+    "매입채무의증가": "매입채무의증가(감소)",
+    "미지급금의감소": "미지급금의증가(감소)",
+    "선수금의증가": "선수금의증가(감소)",
+    "예수금의감소": "예수금의증가(감소)",
+    "미지급비용의감소": "미지급비용의증가(감소)",
+    "토지의취득": "토지취득",
+    "무형자산의증가": "무형자산의취득",
+    "현금의증가(i+ii+iii)": "현금의증가(감소)(i+ii+iii)",
+}
+_COMPLETE_LABEL_SUFFIXES = {
+    "현금의유출이없는비용등의가산": "가산",
+    "현금의유입이없는수익등의차감": "차감",
+    "영업활동으로인한자산부채의변동": "변동",
+}
+_REPEAT_SENSITIVE_ITEM_KEYS = {
+    "대손충당금",
+    "감가상각누계액",
+    "정부보조금",
+}
+_CORE_SECTION_KEYS = {"자산", "부채", "자본"}
+_SEMANTIC_SECTION_KEYS = {
+    "유동자산",
+    "비유동자산",
+    "유동부채",
+    "비유동부채",
+    "매출액",
+    "매출원가",
+    "매출총이익",
+    "매출총손실",
+    "판매비와관리비",
+    "영업손익",
+    "영업외수익",
+    "영업외비용",
+    "법인세차감전순손익",
+    "법인세등",
+    "당기순손익",
+    "영업활동으로인한현금흐름",
+    "투자활동으로인한현금흐름",
+    "재무활동으로인한현금흐름",
+}
+_ROMAN_ITEM_PATTERN = re.compile(
+    r"^\s*(?:[IVXLCDM]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+)\s*[\.\)]",
+    flags=re.IGNORECASE,
+)
+_PARENTHESIZED_ITEM_PATTERN = re.compile(r"^\s*\(\s*(?:\d+|[가-힣])\s*\)")
+_ARABIC_ITEM_PATTERN = re.compile(r"^\s*\d+\s*[\.\)]")
+_KOREAN_ITEM_PATTERN = re.compile(r"^\s*[가-힣]\s*[\.\)]")
 
 
 def parse_disclosure_inputs(value: str) -> list[str]:
@@ -774,7 +847,150 @@ def _normalized_item_key(value: Any) -> str:
         previous = label
         label = _LEADING_ITEM_NUMBER_PATTERN.sub("", label)
     label = _TRAILING_NOTE_REFERENCE_PATTERN.sub("", label)
-    return re.sub(r"\s+", "", label).casefold()
+    key = re.sub(r"\s+", "", label).casefold()
+    return _ITEM_KEY_ALIASES.get(key, key)
+
+
+def _explicit_hierarchy_level(value: Any) -> int | None:
+    """Return the visible statement hierarchy level encoded in a Korean label."""
+
+    label = unicodedata.normalize("NFKC", _clean_item_value(value))
+    compact = re.sub(r"\s+", "", label)
+    if compact in _CORE_SECTION_KEYS:
+        return 0
+    if _normalized_item_key(label) in _SEMANTIC_SECTION_KEYS:
+        return 1
+    if _ROMAN_ITEM_PATTERN.match(label):
+        return 1
+    if _PARENTHESIZED_ITEM_PATTERN.match(label):
+        return 2
+    if _ARABIC_ITEM_PATTERN.match(label):
+        return 3
+    if _KOREAN_ITEM_PATTERN.match(label):
+        return 4
+    return None
+
+
+def _row_identity_tokens(labels: Sequence[Any]) -> list[tuple[str, ...]]:
+    """Build context-aware identities so repeated subaccounts stay separate."""
+
+    core_key = ""
+    roman_key = ""
+    explicit_parents: dict[int, str] = {}
+    tokens: list[tuple[str, ...]] = []
+
+    for value in labels:
+        key = _normalized_item_key(value)
+        level = _explicit_hierarchy_level(value)
+        if level == 0:
+            core_key = key
+            roman_key = ""
+            explicit_parents.clear()
+        elif level == 1:
+            roman_key = key
+            explicit_parents = {1: key}
+        elif level is not None:
+            explicit_parents[level] = key
+            explicit_parents = {
+                parent_level: parent_key
+                for parent_level, parent_key in explicit_parents.items()
+                if parent_level <= level
+            }
+
+        token = (key, core_key, roman_key)
+        if key in _REPEAT_SENSITIVE_ITEM_KEYS:
+            parent_key = ""
+            for parent_level in sorted(explicit_parents, reverse=True):
+                if explicit_parents[parent_level] != key:
+                    parent_key = explicit_parents[parent_level]
+                    break
+            token = (*token, parent_key)
+        tokens.append(token)
+    return tokens
+
+
+def _preferred_aligned_label(previous: Any, current: Any, key: str) -> str:
+    """Prefer a complete PDF label over a newer line-wrapped truncation."""
+
+    previous_label = _clean_item_value(previous)
+    current_label = _clean_item_value(current)
+    complete_suffix = _COMPLETE_LABEL_SUFFIXES.get(key)
+    if not complete_suffix:
+        return current_label
+    if re.sub(r"\s+", "", current_label).endswith(complete_suffix):
+        return current_label
+    if re.sub(r"\s+", "", previous_label).endswith(complete_suffix):
+        return previous_label
+    return current_label
+
+
+def _reconcile_duplicate_rows(
+    rows: list[dict[str, Any]],
+    ordered_periods: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Merge safe duplicate rows left by layout changes between filing years."""
+
+    if len(rows) < 2:
+        return rows
+
+    tokens = _row_identity_tokens([row["label"] for row in rows])
+    grouped_indices: dict[tuple[str, ...], list[int]] = {}
+    for index, token in enumerate(tokens):
+        grouped_indices.setdefault(token, []).append(index)
+
+    removed_indices: set[int] = set()
+    period_rank = {period: index for index, period in enumerate(ordered_periods)}
+    for indices in grouped_indices.values():
+        if len(indices) < 2:
+            continue
+
+        populated_periods = [
+            {
+                period
+                for period, value in rows[index]["values"].items()
+                if not _is_blank_cell(value)
+            }
+            for index in indices
+        ]
+        if any(
+            populated_periods[left] & populated_periods[right]
+            for left in range(len(indices))
+            for right in range(left + 1, len(indices))
+        ):
+            continue
+
+        def newest_rank(index: int) -> tuple[int, int]:
+            populated = [
+                period_rank.get(period, len(period_rank))
+                for period, value in rows[index]["values"].items()
+                if not _is_blank_cell(value)
+            ]
+            return (min(populated, default=len(period_rank)), index)
+
+        keeper_index = min(indices, key=newest_rank)
+        keeper = rows[keeper_index]
+        complete_suffix = _COMPLETE_LABEL_SUFFIXES.get(str(keeper["key"]))
+        if complete_suffix:
+            complete_indices = [
+                index
+                for index in indices
+                if re.sub(r"\s+", "", str(rows[index]["label"])).endswith(
+                    complete_suffix
+                )
+            ]
+            if complete_indices:
+                keeper["label"] = rows[min(complete_indices, key=newest_rank)]["label"]
+        for donor_index in indices:
+            if donor_index == keeper_index:
+                continue
+            for period, value in rows[donor_index]["values"].items():
+                if not _is_blank_cell(value):
+                    keeper["values"][period] = value
+            removed_indices.add(donor_index)
+
+    return [
+        row for index, row in enumerate(rows) if index not in removed_indices
+    ]
 
 
 def _period_dates(header: str) -> list[str]:
@@ -963,11 +1179,12 @@ def merge_statement_frames(
 
         current_labels = [_clean_item_value(value) for value in frame.iloc[:, 0]]
         current_keys = [_normalized_item_key(value) for value in current_labels]
-        master_keys = [str(row["key"]) for row in rows]
+        current_tokens = _row_identity_tokens(current_labels)
+        master_tokens = _row_identity_tokens([row["label"] for row in rows])
         matcher = SequenceMatcher(
             None,
-            master_keys,
-            current_keys,
+            master_tokens,
+            current_tokens,
             autojunk=False,
         )
 
@@ -977,7 +1194,11 @@ def merge_statement_frames(
             if tag == "equal":
                 for offset, current_index in enumerate(range(new_start, new_end)):
                     row = rows[old_start + offset]
-                    row["label"] = current_labels[current_index]
+                    row["label"] = _preferred_aligned_label(
+                        row["label"],
+                        current_labels[current_index],
+                        str(row["key"]),
+                    )
                     aligned_rows.append(row)
                     current_mapping[current_index] = row
                 continue
@@ -1011,6 +1232,7 @@ def merge_statement_frames(
                 )
 
     ordered_periods = sorted(period_headers, key=_period_sort_key, reverse=True)
+    rows = _reconcile_duplicate_rows(rows, ordered_periods)
     output_rows = [
         [row["label"]] + [row["values"].get(period, "") for period in ordered_periods]
         for row in rows
@@ -1093,22 +1315,53 @@ def _display_width(value: Any) -> int:
 
 
 def format_worksheet(worksheet: Any) -> None:
-    """Apply the small, deterministic formatting set required for outputs."""
+    """Format hierarchy and amounts like a compact Korean financial statement."""
 
     worksheet.freeze_panes = "A2"
     worksheet.sheet_view.showGridLines = False
+    major_fill = PatternFill(fill_type="solid", fgColor=_HIGHLIGHT_DARK)
+    section_fill = PatternFill(fill_type="solid", fgColor=_HIGHLIGHT_MEDIUM)
+    subgroup_fill = PatternFill(fill_type="solid", fgColor=_HIGHLIGHT_ACCENT)
+    header_fill = PatternFill(fill_type="solid", fgColor=_HIGHLIGHT_DARK)
+    white_bold_font = Font(bold=True, color=_HIGHLIGHT_TEXT)
+    bold_font = Font(bold=True)
+    thin_teal = Side(style="thin", color=_HIGHLIGHT_ACCENT)
+    medium_teal = Side(style="medium", color=_HIGHLIGHT_DARK)
 
     for cell in worksheet[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+        cell.font = white_bold_font
+        cell.fill = header_fill
         cell.alignment = Alignment(
             horizontal="center",
             vertical="center",
             wrap_text=True,
         )
 
+    current_explicit_indent = 0
     for row in worksheet.iter_rows(min_row=2):
         has_number = False
+        label = _clean_item_value(row[0].value)
+        compact_label = re.sub(r"\s+", "", label)
+        hierarchy_level = _explicit_hierarchy_level(label)
+        is_core_section = compact_label in _CORE_SECTION_KEYS
+        is_total = "총계" in compact_label or compact_label.endswith("합계")
+
+        if hierarchy_level == 0:
+            current_explicit_indent = 0
+        elif hierarchy_level == 1:
+            current_explicit_indent = 0
+        elif hierarchy_level == 2:
+            current_explicit_indent = 1
+        elif hierarchy_level == 3:
+            current_explicit_indent = 2
+        elif hierarchy_level == 4:
+            current_explicit_indent = 3
+        row_indent = (
+            current_explicit_indent
+            if hierarchy_level is not None
+            else min(current_explicit_indent + 1, 3)
+        )
+
         for cell in row:
             value = cell.value
             if isinstance(value, numbers.Number) and not isinstance(value, bool):
@@ -1117,10 +1370,40 @@ def format_worksheet(worksheet: Any) -> None:
                 cell.number_format = "#,##0;[Red](#,##0);-"
                 cell.alignment = Alignment(horizontal="right")
                 has_number = True
-            elif cell.column == 1:
-                cell.alignment = Alignment(horizontal="left")
-        if not has_number and row[0].value:
-            row[0].font = Font(bold=True)
+        row[0].alignment = Alignment(
+            horizontal="left",
+            vertical="center",
+            indent=0 if is_total else row_indent,
+        )
+
+        if is_core_section:
+            for cell in row:
+                cell.fill = major_fill
+                cell.font = white_bold_font
+                cell.border = Border(top=medium_teal, bottom=medium_teal)
+        elif hierarchy_level == 1:
+            for cell in row:
+                cell.fill = section_fill
+                cell.font = white_bold_font
+                cell.border = Border(top=thin_teal, bottom=thin_teal)
+        elif hierarchy_level == 2:
+            for cell in row:
+                cell.fill = subgroup_fill
+                cell.font = white_bold_font
+        elif is_total:
+            for cell in row:
+                cell.font = bold_font
+                cell.border = Border(top=medium_teal)
+        elif not has_number and row[0].value:
+            row[0].font = bold_font
+
+        if is_core_section or hierarchy_level in {1, 2}:
+            for cell in row[1:]:
+                if isinstance(cell.value, numbers.Number) and not isinstance(
+                    cell.value,
+                    bool,
+                ):
+                    cell.number_format = "#,##0;(#,##0);-"
 
     for column_index, column_cells in enumerate(worksheet.columns, start=1):
         content_width = max((_display_width(cell.value) for cell in column_cells), default=0)
