@@ -759,6 +759,112 @@ class MultiYearMergeTests(unittest.TestCase):
             self.assertNotEqual(row.iloc[0]["2024-12-31"], "")
             self.assertNotEqual(row.iloc[0]["2025-12-31"], "")
 
+    def test_merges_revenue_details_when_an_old_pdf_omits_the_revenue_section(self):
+        year_2022 = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", 14_669_028_629],
+                ["1. 제품매출", 14_353_770_588],
+                ["2. 상품매출액", 315_258_041],
+            ],
+            columns=["항목", "2022-12-31"],
+        )
+        year_2023 = pd.DataFrame(
+            [
+                ["제품매출액", 11_634_144_630],
+                ["상품매출액", 141_028_811],
+            ],
+            columns=["항목", "2023-12-31"],
+        )
+        year_2024 = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", 16_582_300_361],
+                ["1. 제품매출", 16_582_300_361],
+            ],
+            columns=["항목", "2024-12-31"],
+        )
+        year_2025 = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", 24_249_766_099],
+                ["1. 제품매출", 24_249_766_099],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (
+                    FilingMetadata("테스트", "감사보고서", "2023.03"),
+                    year_2022,
+                ),
+                (
+                    FilingMetadata("테스트", "감사보고서", "2024.03"),
+                    year_2023,
+                ),
+                (
+                    FilingMetadata("테스트", "감사보고서", "2025.03"),
+                    year_2024,
+                ),
+                (
+                    FilingMetadata("테스트", "감사보고서", "2026.03"),
+                    year_2025,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            merged["항목"].to_list(),
+            ["Ⅰ.매출액", "1. 제품매출", "상품매출액"],
+        )
+        product = merged.iloc[1]
+        goods = merged.iloc[2]
+        self.assertEqual(
+            [
+                product[year]
+                for year in (
+                    "2025-12-31",
+                    "2024-12-31",
+                    "2023-12-31",
+                    "2022-12-31",
+                )
+            ],
+            [24_249_766_099, 16_582_300_361, 11_634_144_630, 14_353_770_588],
+        )
+        self.assertEqual(goods["2025-12-31"], "")
+        self.assertEqual(goods["2024-12-31"], "")
+        self.assertEqual(goods["2023-12-31"], 141_028_811)
+        self.assertEqual(goods["2022-12-31"], 315_258_041)
+
+    def test_normalizes_other_revenue_detail_amount_suffixes(self):
+        old_frame = pd.DataFrame(
+            [["용역매출액", 90]],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", 110],
+                ["1. 용역매출", 110],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (
+                    FilingMetadata("테스트", "감사보고서", "2025.03"),
+                    old_frame,
+                ),
+                (
+                    FilingMetadata("테스트", "감사보고서", "2026.03"),
+                    new_frame,
+                ),
+            ]
+        )
+
+        service = merged[merged["항목"] == "1. 용역매출"]
+        self.assertEqual(len(service), 1)
+        self.assertEqual(service.iloc[0]["2025-12-31"], 110)
+        self.assertEqual(service.iloc[0]["2024-12-31"], 90)
+
     def test_merges_government_subsidy_only_under_the_same_parent(self):
         old_frame = pd.DataFrame(
             [
