@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ SCOPE_LABELS = {
 REPORT_TYPES = ("사업보고서", "반기보고서", "분기보고서", "감사보고서")
 _INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_DART_CONNECTION_ATTEMPTS = 3
+_DART_RETRY_DELAYS = (5, 15)
 
 
 class FinancialExtractionError(RuntimeError):
@@ -185,6 +188,84 @@ def _import_dart_fss() -> Any:
             "dart-fss가 설치되지 않았습니다. requirements.txt 의존성을 설치하세요."
         ) from exc
     return dart
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """Return whether an exception represents a retryable connection failure."""
+
+    retryable_names = {
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "ConnectionError",
+        "ConnectionResetError",
+        "MaxRetryError",
+        "NewConnectionError",
+        "ProtocolError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "Timeout",
+        "TimeoutError",
+    }
+    retryable_messages = (
+        "timed out",
+        "timeout",
+        "max retries exceeded",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "network is unreachable",
+        "remote disconnected",
+    )
+    for error in _exception_chain(exc):
+        if error.__class__.__name__ in retryable_names:
+            return True
+        message = str(error).casefold()
+        if any(marker in message for marker in retryable_messages):
+            return True
+    return False
+
+
+def _set_dart_api_key_with_retry(dart: Any, api_key: str) -> None:
+    """Configure dart-fss, retrying only transient Open DART network errors."""
+
+    for attempt in range(1, _DART_CONNECTION_ATTEMPTS + 1):
+        try:
+            dart.set_api_key(api_key=api_key)
+            return
+        except Exception as exc:
+            if not _is_transient_network_error(exc):
+                raise FinancialExtractionError(
+                    "DART_API_KEY 인증에 실패했습니다. GitHub 저장소의 "
+                    "Actions secret 값이 올바른지 확인하세요."
+                ) from exc
+            if attempt == _DART_CONNECTION_ATTEMPTS:
+                raise FinancialExtractionError(
+                    "Open DART 서버 연결이 계속 지연되어 3번 시도했지만 "
+                    "인증하지 못했습니다. 입력이나 API 키 문제가 아닐 수 있으므로 "
+                    "잠시 후 GitHub Actions에서 Run workflow를 다시 실행하세요."
+                ) from exc
+
+            delay = _DART_RETRY_DELAYS[attempt - 1]
+            print(
+                "Open DART 연결이 지연되어 "
+                f"{delay}초 후 다시 시도합니다 "
+                f"({attempt}/{_DART_CONNECTION_ATTEMPTS})...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def _looks_like_missing_xbrl(exc: Exception) -> bool:
@@ -917,7 +998,7 @@ def _configured_dart(
 ) -> Any:
     api_key = require_api_key(environ)
     dart = _import_dart_fss() if dart_module is None else dart_module
-    dart.set_api_key(api_key=api_key)
+    _set_dart_api_key_with_retry(dart, api_key)
     return dart
 
 
