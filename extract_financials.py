@@ -858,7 +858,20 @@ def _normalized_item_key(value: Any) -> str:
         label = _LEADING_ITEM_NUMBER_PATTERN.sub("", label)
     label = _TRAILING_NOTE_REFERENCE_PATTERN.sub("", label)
     key = re.sub(r"\s+", "", label).casefold()
-    return _ITEM_KEY_ALIASES.get(key, key)
+    key = _ITEM_KEY_ALIASES.get(key, key)
+    if key not in {"매출", "매출액"} and key.endswith("매출액"):
+        key = key[:-1]
+    return key
+
+
+def _semantic_parent_key(key: str) -> str:
+    """Return an unambiguous statement section for detail account keys."""
+
+    if key not in {"매출", "매출액"} and key.endswith("매출"):
+        return "매출액"
+    if key != "매출원가" and key.endswith("매출원가"):
+        return "매출원가"
+    return ""
 
 
 def _explicit_hierarchy_level(value: Any) -> int | None:
@@ -934,7 +947,7 @@ def _row_identity_tokens(labels: Sequence[Any]) -> list[tuple[str, ...]]:
                 if parent_level <= level
             }
 
-        token = (key, core_key, roman_key)
+        token = (key, core_key, _semantic_parent_key(key) or roman_key)
         if key in _REPEAT_SENSITIVE_ITEM_KEYS:
             parent_key = ""
             for parent_level in sorted(explicit_parents, reverse=True):
@@ -944,6 +957,22 @@ def _row_identity_tokens(labels: Sequence[Any]) -> list[tuple[str, ...]]:
             token = (*token, parent_key)
         tokens.append(token)
     return tokens
+
+
+def _row_section_contexts(labels: Sequence[Any]) -> list[str]:
+    """Track the actual section inherited from visible statement rows."""
+
+    roman_key = ""
+    contexts: list[str] = []
+    for value in labels:
+        key = _normalized_item_key(value)
+        level = _explicit_hierarchy_level(value)
+        if level == 0:
+            roman_key = ""
+        elif level == 1:
+            roman_key = key
+        contexts.append(roman_key)
+    return contexts
 
 
 def _preferred_aligned_label(previous: Any, current: Any, key: str) -> str:
@@ -971,6 +1000,7 @@ def _reconcile_duplicate_rows(
         return rows
 
     tokens = _row_identity_tokens([row["label"] for row in rows])
+    section_contexts = _row_section_contexts([row["label"] for row in rows])
     grouped_indices: dict[tuple[str, ...], list[int]] = {}
     for index, token in enumerate(tokens):
         grouped_indices.setdefault(token, []).append(index)
@@ -1004,7 +1034,13 @@ def _reconcile_duplicate_rows(
             ]
             return (min(populated, default=len(period_rank)), index)
 
-        keeper_index = min(indices, key=newest_rank)
+        semantic_parent = _semantic_parent_key(str(rows[indices[0]]["key"]))
+        contextual_indices = [
+            index
+            for index in indices
+            if semantic_parent and section_contexts[index] == semantic_parent
+        ]
+        keeper_index = min(contextual_indices or indices, key=newest_rank)
         keeper = rows[keeper_index]
         complete_suffix = _COMPLETE_LABEL_SUFFIXES.get(str(keeper["key"]))
         if complete_suffix:
