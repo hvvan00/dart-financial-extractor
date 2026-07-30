@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       disclosure:
-        description: "DART 공시 URL 또는 14자리 접수번호"
+        description: "공시 1개 또는 같은 회사의 여러 접수번호(쉼표로 구분)"
         required: true
         type: string
       statement_scope:
