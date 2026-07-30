@@ -15,6 +15,7 @@ from extract_financials import (
     MissingStatementError,
     MissingXbrlError,
     STATEMENT_NAMES,
+    _set_dart_api_key_with_retry,
     export_statements,
     extract_statements,
     flatten_dataframe_columns,
@@ -99,6 +100,65 @@ class ApiKeyTests(unittest.TestCase):
             require_api_key({"DART_API_KEY": " secret-value "}),
             "secret-value",
         )
+
+    def test_transient_timeout_is_retried_until_authentication_succeeds(self):
+        outcomes = iter(
+            [
+                TimeoutError("connection timed out"),
+                TimeoutError("connection timed out"),
+                None,
+            ]
+        )
+        calls = []
+
+        def set_api_key(**kwargs):
+            calls.append(kwargs)
+            outcome = next(outcomes)
+            if outcome is not None:
+                raise outcome
+
+        dart = SimpleNamespace(set_api_key=set_api_key)
+        with patch("extract_financials.time.sleep") as sleep:
+            _set_dart_api_key_with_retry(dart, "secret-value")
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 15])
+
+    def test_repeated_timeout_has_clear_rerun_error_without_exposing_key(self):
+        calls = []
+
+        def set_api_key(**kwargs):
+            calls.append(kwargs)
+            raise TimeoutError("connection timed out")
+
+        dart = SimpleNamespace(set_api_key=set_api_key)
+        with (
+            patch("extract_financials.time.sleep"),
+            self.assertRaises(FinancialExtractionError) as raised,
+        ):
+            _set_dart_api_key_with_retry(dart, "do-not-print-this-key")
+
+        self.assertEqual(len(calls), 3)
+        self.assertIn("3번", str(raised.exception))
+        self.assertIn("다시 실행", str(raised.exception))
+        self.assertNotIn("do-not-print-this-key", str(raised.exception))
+
+    def test_non_network_authentication_error_is_not_retried(self):
+        calls = []
+
+        def set_api_key(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("invalid API key")
+
+        dart = SimpleNamespace(set_api_key=set_api_key)
+        with (
+            patch("extract_financials.time.sleep") as sleep,
+            self.assertRaisesRegex(FinancialExtractionError, "DART_API_KEY"),
+        ):
+            _set_dart_api_key_with_retry(dart, "invalid-key")
+
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
 
 
 class FilingMetadataTests(unittest.TestCase):
@@ -396,6 +456,44 @@ class ExcelOutputTests(unittest.TestCase):
                 self.assertIn(",", worksheet["B2"].number_format)
                 self.assertNotIn("concept", " ".join(str(cell.value) for cell in worksheet[1]).lower())
 
+    def test_formats_statement_hierarchy_with_category_bands_and_indentation(self):
+        hierarchy_frame = pd.DataFrame(
+            [
+                ["자 산", "", ""],
+                ["Ⅰ.유동자산", 100, 90],
+                ["(1) 당좌자산", 100, 90],
+                ["1. 현금및현금성자산", 110, 100],
+                ["대손충당금", -10, -10],
+                ["자 산 총 계", 100, 90],
+            ],
+            columns=["항목", "2025-12-31", "2024-12-31"],
+        )
+        statements = {name: hierarchy_frame.copy() for name in STATEMENT_NAMES}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = export_statements(
+                statements,
+                metadata=FilingMetadata("테스트", "사업보고서", "2026.03"),
+                output_mode="single",
+                output_dir=Path(temp_dir),
+            )[0]
+            worksheet = load_workbook(path)["재무상태표"]
+
+            self.assertEqual(worksheet["A1"].fill.fgColor.rgb[-6:], "006074")
+            self.assertEqual(worksheet["A1"].font.color.rgb[-6:], "FFFFFF")
+            self.assertEqual(worksheet["A2"].fill.fgColor.rgb[-6:], "006074")
+            self.assertEqual(worksheet["A2"].font.color.rgb[-6:], "FFFFFF")
+            self.assertEqual(worksheet["A3"].fill.fgColor.rgb[-6:], "008187")
+            self.assertEqual(worksheet["A3"].font.color.rgb[-6:], "FFFFFF")
+            self.assertNotIn("[Red]", worksheet["B3"].number_format)
+            self.assertEqual(worksheet["A4"].fill.fgColor.rgb[-6:], "06A39F")
+            self.assertEqual(worksheet["A4"].font.color.rgb[-6:], "FFFFFF")
+            self.assertNotIn("[Red]", worksheet["B4"].number_format)
+            self.assertEqual(worksheet["A5"].alignment.indent, 2)
+            self.assertEqual(worksheet["A6"].alignment.indent, 3)
+            self.assertTrue(worksheet["A7"].font.bold)
+            self.assertEqual(worksheet["A7"].border.top.style, "medium")
+
     def test_separate_mode_creates_exactly_three_individual_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = export_statements(
@@ -465,11 +563,11 @@ class MultiYearMergeTests(unittest.TestCase):
 
     def test_note_reference_change_does_not_create_duplicate_row(self):
         old_frame = pd.DataFrame(
-            [["1. 현금및현금성자산 (주석 3)", 30]],
+            [["1. 현금및현금성자산 (주석 3과 6)", 30]],
             columns=["항목", "2024-12-31"],
         )
         new_frame = pd.DataFrame(
-            [["현금및현금성자산 (주석 4)", 40]],
+            [["현금및현금성자산 (주석 4, 7)", 40]],
             columns=["항목", "2025-12-31"],
         )
 
@@ -483,6 +581,211 @@ class MultiYearMergeTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged.iloc[0]["2025-12-31"], 40)
         self.assertEqual(merged.iloc[0]["2024-12-31"], 30)
+
+    def test_merges_known_label_aliases_within_the_same_section(self):
+        old_frame = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", 100],
+                ["제품매출액", 100],
+                ["Ⅱ.판매비와관리비", 10],
+                ["세금과공과", 10],
+                ["Ⅴ.영업이익", 90],
+                ["Ⅹ.당기순이익", 90],
+            ],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", 120],
+                ["1. 제품매출", 120],
+                ["Ⅱ.판매비와관리비", 12],
+                ["9. 세금과공과금", 12],
+                ["Ⅴ.영업이익(손실)", 108],
+                ["Ⅹ.당기순이익(손실)", 108],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (FilingMetadata("테스트", "사업보고서", "2025.03"), old_frame),
+                (FilingMetadata("테스트", "사업보고서", "2026.03"), new_frame),
+            ]
+        )
+
+        for label in (
+            "1. 제품매출",
+            "9. 세금과공과금",
+            "Ⅴ.영업이익(손실)",
+            "Ⅹ.당기순이익(손실)",
+        ):
+            row = merged[merged["항목"] == label]
+            self.assertEqual(len(row), 1)
+            self.assertNotEqual(row.iloc[0]["2024-12-31"], "")
+            self.assertNotEqual(row.iloc[0]["2025-12-31"], "")
+
+    def test_merges_government_subsidy_only_under_the_same_parent(self):
+        old_frame = pd.DataFrame(
+            [
+                ["자 산", "",],
+                ["Ⅱ.비유동자산", 270],
+                ["(2) 유형자산", 270],
+                ["1. 토지", 100],
+                ["국고보조금", -10],
+                ["2. 건물", 200],
+                ["국고보조금", -20],
+            ],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["자 산", ""],
+                ["Ⅱ.비유동자산", 268],
+                ["(2) 유형자산", 268],
+                ["1. 토지", 100],
+                ["정부보조금", -11],
+                ["2. 건물", 200],
+                ["정부보조금", -21],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (FilingMetadata("테스트", "사업보고서", "2025.03"), old_frame),
+                (FilingMetadata("테스트", "사업보고서", "2026.03"), new_frame),
+            ]
+        )
+
+        subsidies = merged[merged["항목"] == "정부보조금"].reset_index(drop=True)
+        self.assertEqual(len(subsidies), 2)
+        self.assertEqual(subsidies.iloc[0]["2025-12-31"], -11)
+        self.assertEqual(subsidies.iloc[0]["2024-12-31"], -10)
+        self.assertEqual(subsidies.iloc[1]["2025-12-31"], -21)
+        self.assertEqual(subsidies.iloc[1]["2024-12-31"], -20)
+
+    def test_reconciles_a_same_item_that_moved_within_its_section(self):
+        old_frame = pd.DataFrame(
+            [
+                ["Ⅰ.유동자산", 15],
+                ["미수수익", 10],
+                ["선급비용", 5],
+            ],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["Ⅰ.유동자산", 26],
+                ["8. 선급비용", 6],
+                ["6. 미수수익(주석14)", 20],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (FilingMetadata("테스트", "사업보고서", "2025.03"), old_frame),
+                (FilingMetadata("테스트", "사업보고서", "2026.03"), new_frame),
+            ]
+        )
+
+        interest = merged[merged["항목"] == "6. 미수수익(주석14)"]
+        prepaid = merged[merged["항목"] == "8. 선급비용"]
+        self.assertEqual(len(interest), 1)
+        self.assertEqual(interest.iloc[0]["2024-12-31"], 10)
+        self.assertEqual(interest.iloc[0]["2025-12-31"], 20)
+        self.assertEqual(len(prepaid), 1)
+        self.assertEqual(prepaid.iloc[0]["2024-12-31"], 5)
+        self.assertEqual(prepaid.iloc[0]["2025-12-31"], 6)
+
+    def test_merges_clear_pdf_line_break_and_cash_flow_label_variants(self):
+        old_frame = pd.DataFrame(
+            [
+                ["Ⅰ.영업활동으로 인한 현금흐름", 100],
+                ["2.현금의 유출이 없는 비용등의 가산", 20],
+                ["4.영업활동으로 인한 자산부채의 변동", 30],
+                ["가. 매출채권의 감소(증가)", 50],
+            ],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["Ⅰ.영업활동으로 인한 현금흐름", 120],
+                ["2. 현금의 유출이 없는 비용등의 가", 25],
+                ["4. 영업활동으로 인한 자산부채의 변", 35],
+                ["가. 매출채권의 증가", 60],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (FilingMetadata("테스트", "사업보고서", "2025.03"), old_frame),
+                (FilingMetadata("테스트", "사업보고서", "2026.03"), new_frame),
+            ]
+        )
+
+        for label in (
+            "2.현금의 유출이 없는 비용등의 가산",
+            "4.영업활동으로 인한 자산부채의 변동",
+            "가. 매출채권의 증가",
+        ):
+            row = merged[merged["항목"] == label]
+            self.assertEqual(len(row), 1)
+            self.assertNotEqual(row.iloc[0]["2024-12-31"], "")
+            self.assertNotEqual(row.iloc[0]["2025-12-31"], "")
+
+    def test_old_audit_pdf_uses_current_year_and_removes_document_headers(self):
+        frame = pd.DataFrame(
+            [
+                ["재 무 상 태 표", "", ""],
+                ["제 기 2022년 12월 31일 현재", 16, ""],
+                ["제 기 2021년 12월 31일 현재", 15, ""],
+                ["회사명 : 주식회사 테스트 (단위 : 원)", "", ""],
+                ["제 (전) 기", "", 15],
+                ["과 목 제 (당) 기", 16, ""],
+                ["자 산", "", ""],
+                ["Ⅰ.유동자산", 100, 90],
+                ["", 200, ""],
+                ["자 산 총 계", "", 180],
+                ["#NAME?", "", ""],
+                ["별첨 재무제표에 대한 주석 참조", "", ""],
+            ],
+            columns=["과목", "당기", "전기"],
+        )
+
+        merged = merge_statement_frames(
+            [(FilingMetadata("테스트", "감사보고서", "2023.04"), frame)],
+            primary_period_only=True,
+        )
+
+        self.assertEqual(merged.columns.to_list(), ["항목", "2022년"])
+        self.assertEqual(
+            merged["항목"].to_list(),
+            ["자 산", "Ⅰ.유동자산", "자 산 총 계"],
+        )
+        total = merged[merged["항목"] == "자 산 총 계"].iloc[0]
+        self.assertEqual(total["2022년"], 200)
+
+    def test_quarterly_merge_keeps_only_the_current_standalone_quarter(self):
+        frame = pd.DataFrame(
+            [["매출액", 30, 90, 25, 70]],
+            columns=[
+                "항목",
+                "2025-07-01 ~ 2025-09-30",
+                "2025-01-01 ~ 2025-09-30",
+                "2024-07-01 ~ 2024-09-30",
+                "2024-01-01 ~ 2024-09-30",
+            ],
+        )
+
+        merged = merge_statement_frames(
+            [(FilingMetadata("테스트", "분기보고서", "2025.11"), frame)],
+            primary_period_only=True,
+        )
+
+        self.assertEqual(merged.columns.to_list(), ["항목", "2025년 3분기"])
+        self.assertEqual(merged.iloc[0]["2025년 3분기"], 30)
 
     def test_run_many_creates_one_multi_year_workbook(self):
         def filing(receipt, year_month, current_year, prior_year):
@@ -526,13 +829,13 @@ class MultiYearMergeTests(unittest.TestCase):
             self.assertEqual(len(returned_filings), 2)
             self.assertEqual(
                 paths[0].name,
-                "테스트 주식회사_사업보고서_2022-2024.xlsx",
+                "테스트 주식회사_사업보고서_2023-2024.xlsx",
             )
             workbook = load_workbook(paths[0])
             self.assertEqual(workbook.sheetnames, list(STATEMENT_NAMES))
             self.assertEqual(
                 [cell.value for cell in workbook["재무상태표"][1]],
-                ["항목", "2024-12-31", "2023-12-31", "2022-12-31"],
+                ["항목", "2024년", "2023년"],
             )
 
     def test_run_many_rejects_different_companies(self):
