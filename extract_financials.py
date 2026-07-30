@@ -14,6 +14,7 @@ import time
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -592,6 +593,101 @@ def _clean_item_value(value: Any) -> str:
     return re.sub(r"\s*\[abstract\]\s*$", "", text, flags=re.IGNORECASE)
 
 
+def _is_blank_cell(value: Any) -> bool:
+    if value is None or (isinstance(value, str) and value == ""):
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_document_noise_item(value: Any) -> bool:
+    text = _clean_item_value(value)
+    compact = re.sub(r"\s+", "", text).casefold()
+    if not compact:
+        return False
+    if compact in {
+        "#name?",
+        "재무상태표",
+        "손익계산서",
+        "포괄손익계산서",
+        "현금흐름표",
+    }:
+        return True
+    if any(
+        marker in compact
+        for marker in (
+            "회사명:",
+            "감사받지아니한재무제표",
+            "별첨재무제표",
+            "별첨주석",
+            "첨부된주석",
+        )
+    ):
+        return True
+    if re.match(r"^제(?:\d+)?기", compact) and re.search(
+        r"(?:19|20)\d{2}년",
+        compact,
+    ):
+        return True
+    if re.match(r"^제\((?:당|전)\)기$", compact):
+        return True
+    if re.match(r"^\(?단위:", compact):
+        return True
+    if "과목" in compact and any(marker in compact for marker in ("당", "전")):
+        return True
+    return False
+
+
+def _merge_orphan_amount_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Attach an amount-only continuation row to a safe adjacent item row."""
+
+    if frame.empty or len(frame) < 2:
+        return frame
+
+    merged = frame.copy()
+    drop_indices: list[int] = []
+    for row_index in range(len(merged)):
+        if _clean_item_value(merged.iat[row_index, 0]):
+            continue
+        orphan_values = list(merged.iloc[row_index, 1:])
+        if not any(not _is_blank_cell(value) for value in orphan_values):
+            drop_indices.append(row_index)
+            continue
+
+        candidate_indices = [
+            index
+            for index in (row_index + 1, row_index - 1)
+            if 0 <= index < len(merged)
+            and _clean_item_value(merged.iat[index, 0])
+        ]
+        compatible = [
+            index
+            for index in candidate_indices
+            if all(
+                _is_blank_cell(orphan)
+                or _is_blank_cell(merged.iat[index, column_index])
+                for column_index, orphan in enumerate(orphan_values, start=1)
+            )
+        ]
+        if not compatible:
+            continue
+
+        target_index = compatible[0]
+        for column_index, orphan in enumerate(orphan_values, start=1):
+            if (
+                not _is_blank_cell(orphan)
+                and _is_blank_cell(merged.iat[target_index, column_index])
+            ):
+                merged.iat[target_index, column_index] = orphan
+        drop_indices.append(row_index)
+
+    if drop_indices:
+        merged = merged.drop(index=drop_indices)
+    return merged.reset_index(drop=True)
+
+
 def simplify_statement_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     """Keep one Korean item column and only period columns containing amounts."""
 
@@ -633,7 +729,11 @@ def simplify_statement_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
         lambda row: any(value not in {"", None} for value in row),
         axis=1,
     )
-    return simplified.loc[populated_rows].reset_index(drop=True)
+    simplified = simplified.loc[populated_rows].reset_index(drop=True)
+    simplified = simplified.loc[
+        ~simplified.iloc[:, 0].map(_is_document_noise_item)
+    ].reset_index(drop=True)
+    return _merge_orphan_amount_rows(simplified)
 
 
 _LEADING_ITEM_NUMBER_PATTERN = re.compile(
@@ -700,8 +800,136 @@ def _period_sort_key(header: str) -> tuple[str, str]:
     return (max(dates) if dates else "", header)
 
 
+def _described_period_headers(frame: pd.DataFrame) -> list[str]:
+    if frame is None or frame.empty:
+        return []
+
+    columns = frame.columns.to_list()
+    item_index = max(
+        range(len(columns)),
+        key=lambda index: _item_column_score(columns[index]),
+        default=0,
+    )
+    if _item_column_score(columns[item_index]) == 0:
+        item_index = 0
+
+    periods: list[str] = []
+    for value in frame.iloc[:, item_index]:
+        text = _clean_item_value(value)
+        compact = re.sub(r"\s+", "", text)
+        dates = _period_dates(text)
+        if (
+            dates
+            and re.match(r"^제(?:\d+)?기", compact)
+            and any(marker in compact for marker in ("현재", "부터", "까지"))
+        ):
+            period = dates[0] if len(dates) == 1 else f"{dates[0]} ~ {dates[-1]}"
+            if period not in periods:
+                periods.append(period)
+
+    return sorted(periods, key=_period_sort_key, reverse=True)
+
+
+def _resolved_period_headers(
+    raw_frame: pd.DataFrame,
+    simplified: pd.DataFrame,
+    metadata: FilingMetadata,
+) -> list[str]:
+    described_periods = _described_period_headers(raw_frame)
+    resolved: list[str] = []
+    for column in simplified.columns[1:]:
+        header = str(column)
+        if _period_dates(header):
+            resolved.append(header)
+            continue
+
+        compact = _normalized_header_part(header)
+        if "당" in compact and described_periods:
+            resolved.append(described_periods[0])
+        elif "전" in compact and len(described_periods) >= 2:
+            resolved.append(described_periods[1])
+        else:
+            resolved.append(_qualified_period_header(header, metadata))
+    return _deduplicate_headers(resolved)
+
+
+def _period_duration_days(header: str) -> int:
+    dates = _period_dates(header)
+    if len(dates) < 2:
+        return 0
+    return (date.fromisoformat(dates[-1]) - date.fromisoformat(dates[0])).days
+
+
+def _primary_period_index(
+    headers: Sequence[str],
+    metadata: FilingMetadata,
+) -> int:
+    dated = [
+        (index, _period_dates(header))
+        for index, header in enumerate(headers)
+        if _period_dates(header)
+    ]
+    if dated:
+        latest_end = max(max(dates) for _, dates in dated)
+        candidates = [
+            index for index, dates in dated if max(dates) == latest_end
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if metadata.report_type == "분기보고서":
+            return min(candidates, key=lambda index: _period_duration_days(headers[index]))
+        return max(candidates, key=lambda index: _period_duration_days(headers[index]))
+
+    current = [
+        index
+        for index, header in enumerate(headers)
+        if "당" in _normalized_header_part(header)
+        and "전" not in _normalized_header_part(header)
+    ]
+    return current[0] if current else 0
+
+
+def _display_period_label(header: str, metadata: FilingMetadata) -> str:
+    dates = _period_dates(header)
+    if dates:
+        end_date = date.fromisoformat(max(dates))
+        year = end_date.year
+        month = end_date.month
+    else:
+        filing_year, filing_month = (
+            int(part) for part in metadata.year_month.split(".", maxsplit=1)
+        )
+        year = (
+            filing_year - 1
+            if metadata.report_type in {"사업보고서", "감사보고서"}
+            else filing_year
+        )
+        month = {
+            "분기보고서": 3 if filing_month <= 6 else 9,
+            "반기보고서": 6,
+        }.get(metadata.report_type, 12)
+
+    if metadata.report_type in {"사업보고서", "감사보고서"}:
+        return f"{year}년"
+    if metadata.report_type == "반기보고서":
+        return f"{year}년 반기"
+    quarter = max(1, min(4, (month - 1) // 3 + 1))
+    return f"{year}년 {quarter}분기"
+
+
+def _has_primary_amount_or_core_section(row: pd.Series) -> bool:
+    label = re.sub(r"\s+", "", _clean_item_value(row.iloc[0]))
+    if not label:
+        return False
+    if any(not _is_blank_cell(value) for value in row.iloc[1:]):
+        return True
+    return label in {"자산", "부채", "자본"}
+
+
 def merge_statement_frames(
     filings: Sequence[tuple[FilingMetadata, pd.DataFrame]],
+    *,
+    primary_period_only: bool = False,
 ) -> pd.DataFrame:
     """Merge one statement across filings without fuzzy-matching changed items."""
 
@@ -718,6 +946,20 @@ def merge_statement_frames(
                 "연도별 병합 중 항목과 기간별 금액으로 정리할 수 없는 "
                 "재무제표가 발견되었습니다."
             )
+
+        resolved_headers = _resolved_period_headers(raw_frame, frame, metadata)
+        frame.columns = ["항목", *resolved_headers]
+        if primary_period_only:
+            primary_index = _primary_period_index(resolved_headers, metadata)
+            display_header = _display_period_label(
+                resolved_headers[primary_index],
+                metadata,
+            )
+            frame = frame.iloc[:, [0, primary_index + 1]].copy()
+            frame.columns = ["항목", display_header]
+            frame = frame.loc[
+                frame.apply(_has_primary_amount_or_core_section, axis=1)
+            ].reset_index(drop=True)
 
         current_labels = [_clean_item_value(value) for value in frame.iloc[:, 0]]
         current_keys = [_normalized_item_key(value) for value in current_labels]
@@ -754,10 +996,7 @@ def merge_statement_frames(
                 aligned_rows.extend(rows[old_start:old_end])
 
         rows = aligned_rows
-        current_periods = [
-            _qualified_period_header(str(column), metadata)
-            for column in frame.columns[1:]
-        ]
+        current_periods = [str(column) for column in frame.columns[1:]]
 
         for period in current_periods:
             if period in period_headers:
@@ -789,7 +1028,8 @@ def merge_filing_statements(
             [
                 (filing.metadata, filing.statements[statement_name])
                 for filing in filings
-            ]
+            ],
+            primary_period_only=True,
         )
         for statement_name in STATEMENT_NAMES
     }
@@ -835,6 +1075,7 @@ def _merged_year_range(statements: Mapping[str, pd.DataFrame]) -> str:
         for column in frame.columns[1:]:
             dates = _period_dates(str(column))
             years.update(date[:4] for date in dates)
+            years.update(re.findall(r"(?:19|20)\d{2}", str(column)))
     if not years:
         raise FinancialExtractionError(
             "병합된 재무제표의 기간에서 연도를 확인할 수 없습니다."

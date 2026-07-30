@@ -447,6 +447,26 @@ def _merge_wrapped_matrix_rows(matrix: list[list[str]]) -> list[list[str]]:
     return merged
 
 
+def _line_text(line: Sequence[dict[str, Any]]) -> str:
+    return " ".join(_clean_cell(word["text"]) for word in line)
+
+
+def _described_periods(
+    lines: Sequence[Sequence[dict[str, Any]]],
+) -> list[str]:
+    periods: list[str] = []
+    for line in lines:
+        text = _line_text(line)
+        compact = _compact_text(text)
+        if (
+            compact.startswith("제")
+            and re.search(r"(?:19|20)\d{2}년", compact)
+            and any(marker in compact for marker in ("현재", "부터", "까지"))
+        ):
+            periods.append(text)
+    return periods
+
+
 def _region_word_matrix(region: Any) -> list[list[str]] | None:
     """Recover a clean table by assigning words to visible period columns."""
 
@@ -469,6 +489,14 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
         None,
     )
     if header_index is None:
+        loose_header_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if "과목" in _compact_text(_line_text(line))
+            ),
+            None,
+        )
         numeric_lines = [
             [
                 word
@@ -486,8 +514,20 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
         note_word = None
         note_anchor = None
         account_boundary = None
-        header = ["과목", "당기", "전기"]
-        data_lines = lines
+        described_periods = _described_periods(
+            lines[:loose_header_index]
+            if loose_header_index is not None
+            else lines
+        )
+        if len(described_periods) >= 2:
+            header = ["과목", *described_periods[-2:]]
+        else:
+            header = ["과목", "당기", "전기"]
+        data_lines = (
+            lines[loose_header_index + 1 :]
+            if loose_header_index is not None
+            else lines
+        )
     else:
         header_words = lines[header_index]
         period_starts = [
@@ -536,17 +576,7 @@ def _region_word_matrix(region: Any) -> list[list[str]] | None:
             for word in header_words
             if _word_center(word) >= period_boundary
         )
-        described_periods = [
-            " ".join(_clean_cell(word["text"]) for word in line)
-            for line in lines[:header_index]
-            if _compact_text(" ".join(str(word["text"]) for word in line)).startswith(
-                "제"
-            )
-            and re.search(
-                r"(?:19|20)\d{2}년",
-                _compact_text(" ".join(str(word["text"]) for word in line)),
-            )
-        ]
+        described_periods = _described_periods(lines[:header_index])
         if len(described_periods) >= 2:
             current_header, prior_header = described_periods[-2:]
 
