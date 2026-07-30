@@ -13,6 +13,7 @@ import tempfile
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,17 @@ class FilingMetadata:
     def filename_stem(self) -> str:
         company = _safe_filename_part(self.company_name)
         return f"{company}_{self.report_type}_{self.year_month}"
+
+
+@dataclass(frozen=True)
+class FilingExtraction:
+    """The statements and provenance extracted from one DART filing."""
+
+    metadata: FilingMetadata
+    statements: Mapping[str, pd.DataFrame]
+    selected_scope: str
+    receipt_number: str
+    source: str
 
 
 def _safe_filename_part(value: str) -> str:
@@ -543,6 +555,213 @@ def simplify_statement_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     return simplified.loc[populated_rows].reset_index(drop=True)
 
 
+_LEADING_ITEM_NUMBER_PATTERN = re.compile(
+    r"^\s*(?:(?:[IVXLCDM]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+|\d+|[가-힣])"
+    r"\s*[\.\)\-:]\s*|\(\s*(?:\d+|[가-힣])\s*\)\s*)+",
+    flags=re.IGNORECASE,
+)
+_TRAILING_NOTE_REFERENCE_PATTERN = re.compile(
+    r"\s*[\(\[]\s*(?:주석|notes?)\s*[\d,\-~·ㆍ\s]+\s*[\)\]]\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_disclosure_inputs(value: str) -> list[str]:
+    """Split comma/newline-separated filings and reject duplicate receipts."""
+
+    disclosures = [part.strip() for part in re.split(r"[,\r\n]+", value) if part.strip()]
+    if not disclosures:
+        raise FinancialExtractionError(
+            "DART 공시 URL 또는 14자리 접수번호를 하나 이상 입력하세요."
+        )
+
+    seen_receipts: set[str] = set()
+    for disclosure in disclosures:
+        receipt_number = parse_disclosure_reference(disclosure).receipt_number
+        if receipt_number in seen_receipts:
+            raise FinancialExtractionError(
+                f"같은 접수번호가 두 번 입력되었습니다: {receipt_number}"
+            )
+        seen_receipts.add(receipt_number)
+    return disclosures
+
+
+def _normalized_item_key(value: Any) -> str:
+    label = unicodedata.normalize("NFKC", _clean_item_value(value))
+    previous = None
+    while label != previous:
+        previous = label
+        label = _LEADING_ITEM_NUMBER_PATTERN.sub("", label)
+    label = _TRAILING_NOTE_REFERENCE_PATTERN.sub("", label)
+    return re.sub(r"\s+", "", label).casefold()
+
+
+def _period_dates(header: str) -> list[str]:
+    dates = [
+        f"{year}-{int(month):02d}-{int(day):02d}"
+        for year, month, day in _DATE_PATTERN.findall(header)
+    ]
+    dates.extend(
+        f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        for date in _COMPACT_DATE_PATTERN.findall(header)
+    )
+    return list(dict.fromkeys(dates))
+
+
+def _qualified_period_header(header: str, metadata: FilingMetadata) -> str:
+    if _period_dates(header):
+        return header
+    return f"{metadata.year_month} | {header}"
+
+
+def _period_sort_key(header: str) -> tuple[str, str]:
+    dates = _period_dates(header)
+    return (max(dates) if dates else "", header)
+
+
+def merge_statement_frames(
+    filings: Sequence[tuple[FilingMetadata, pd.DataFrame]],
+) -> pd.DataFrame:
+    """Merge one statement across filings without fuzzy-matching changed items."""
+
+    rows: list[dict[str, Any]] = []
+    period_headers: set[str] = set()
+
+    for metadata, raw_frame in sorted(
+        filings,
+        key=lambda item: item[0].year_month,
+    ):
+        frame = simplify_statement_dataframe(raw_frame)
+        if frame.empty:
+            raise MissingStatementError(
+                "연도별 병합 중 항목과 기간별 금액으로 정리할 수 없는 "
+                "재무제표가 발견되었습니다."
+            )
+
+        current_labels = [_clean_item_value(value) for value in frame.iloc[:, 0]]
+        current_keys = [_normalized_item_key(value) for value in current_labels]
+        master_keys = [str(row["key"]) for row in rows]
+        matcher = SequenceMatcher(
+            None,
+            master_keys,
+            current_keys,
+            autojunk=False,
+        )
+
+        aligned_rows: list[dict[str, Any]] = []
+        current_mapping: dict[int, dict[str, Any]] = {}
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+            if tag == "equal":
+                for offset, current_index in enumerate(range(new_start, new_end)):
+                    row = rows[old_start + offset]
+                    row["label"] = current_labels[current_index]
+                    aligned_rows.append(row)
+                    current_mapping[current_index] = row
+                continue
+
+            if tag in {"replace", "insert"}:
+                for current_index in range(new_start, new_end):
+                    row = {
+                        "key": current_keys[current_index],
+                        "label": current_labels[current_index],
+                        "values": {},
+                    }
+                    aligned_rows.append(row)
+                    current_mapping[current_index] = row
+
+            if tag in {"replace", "delete"}:
+                aligned_rows.extend(rows[old_start:old_end])
+
+        rows = aligned_rows
+        current_periods = [
+            _qualified_period_header(str(column), metadata)
+            for column in frame.columns[1:]
+        ]
+
+        for period in current_periods:
+            if period in period_headers:
+                for row in rows:
+                    row["values"].pop(period, None)
+            period_headers.add(period)
+
+        for current_index, row in current_mapping.items():
+            for column_index, period in enumerate(current_periods, start=1):
+                row["values"][period] = _as_excel_number(
+                    frame.iloc[current_index, column_index]
+                )
+
+    ordered_periods = sorted(period_headers, key=_period_sort_key, reverse=True)
+    output_rows = [
+        [row["label"]] + [row["values"].get(period, "") for period in ordered_periods]
+        for row in rows
+    ]
+    return pd.DataFrame(output_rows, columns=["항목", *ordered_periods])
+
+
+def merge_filing_statements(
+    filings: Sequence[FilingExtraction],
+) -> dict[str, pd.DataFrame]:
+    """Merge exactly the required three statements across filings."""
+
+    return {
+        statement_name: merge_statement_frames(
+            [
+                (filing.metadata, filing.statements[statement_name])
+                for filing in filings
+            ]
+        )
+        for statement_name in STATEMENT_NAMES
+    }
+
+
+def _normalized_company_name(value: str) -> str:
+    name = unicodedata.normalize("NFKC", value)
+    name = re.sub(r"(?:주식회사|\(주\)|㈜)", "", name)
+    return re.sub(r"\s+", "", name).casefold()
+
+
+def _validate_merge_compatibility(
+    filings: Sequence[FilingExtraction],
+) -> None:
+    companies = {
+        _normalized_company_name(filing.metadata.company_name) for filing in filings
+    }
+    if len(companies) != 1:
+        names = ", ".join(dict.fromkeys(f.metadata.company_name for f in filings))
+        raise FinancialExtractionError(
+            f"연도별 병합에는 같은 회사의 공시만 입력할 수 있습니다: {names}"
+        )
+
+    report_types = {filing.metadata.report_type for filing in filings}
+    if len(report_types) != 1:
+        names = ", ".join(sorted(report_types))
+        raise FinancialExtractionError(
+            f"연도별 병합에는 같은 보고서 종류만 입력할 수 있습니다: {names}"
+        )
+
+    scopes = {filing.selected_scope for filing in filings}
+    if len(scopes) != 1:
+        names = ", ".join(SCOPE_LABELS[scope] for scope in sorted(scopes))
+        raise FinancialExtractionError(
+            "연결과 별도 재무제표를 한 파일에 섞을 수 없습니다. "
+            f"각 공시에서 선택된 범위: {names}"
+        )
+
+
+def _merged_year_range(statements: Mapping[str, pd.DataFrame]) -> str:
+    years: set[str] = set()
+    for frame in statements.values():
+        for column in frame.columns[1:]:
+            dates = _period_dates(str(column))
+            years.update(date[:4] for date in dates)
+    if not years:
+        raise FinancialExtractionError(
+            "병합된 재무제표의 기간에서 연도를 확인할 수 없습니다."
+        )
+    ordered = sorted(years)
+    return ordered[0] if len(ordered) == 1 else f"{ordered[0]}-{ordered[-1]}"
+
+
 def _display_width(value: Any) -> int:
     text = "" if value is None else str(value)
     return sum(
@@ -644,22 +863,16 @@ def export_statements(
     raise ValueError(f"지원하지 않는 출력 방식입니다: {output_mode}")
 
 
-def run(
+def _extract_filing(
     disclosure: str,
     *,
-    scope: str = "auto",
-    output_mode: str = "single",
-    output_dir: Path = Path("output"),
-    environ: Mapping[str, str] | None = None,
-    dart_module: Any | None = None,
-) -> tuple[list[Path], str, str, str]:
-    """Run extraction and return paths, selected scope, receipt, and source."""
+    scope: str,
+    dart: Any,
+) -> FilingExtraction:
+    """Extract one filing without configuring credentials or exporting files."""
 
     reference = parse_disclosure_reference(disclosure)
     receipt_number = reference.receipt_number
-    api_key = require_api_key(environ)
-    dart = _import_dart_fss() if dart_module is None else dart_module
-    dart.set_api_key(api_key=api_key)
     metadata = resolve_filing_metadata(receipt_number, dart)
 
     with tempfile.TemporaryDirectory(prefix="dart-financials-") as temp_dir:
@@ -688,14 +901,92 @@ def run(
             statements, selected_scope = extract_statements(xbrl, scope)
             source = "XBRL"
 
-        paths = export_statements(
-            statements,
-            metadata=metadata,
-            output_mode=output_mode,
-            output_dir=output_dir,
+    return FilingExtraction(
+        metadata=metadata,
+        statements=statements,
+        selected_scope=selected_scope,
+        receipt_number=receipt_number,
+        source=source,
+    )
+
+
+def _configured_dart(
+    *,
+    environ: Mapping[str, str] | None,
+    dart_module: Any | None,
+) -> Any:
+    api_key = require_api_key(environ)
+    dart = _import_dart_fss() if dart_module is None else dart_module
+    dart.set_api_key(api_key=api_key)
+    return dart
+
+
+def run(
+    disclosure: str,
+    *,
+    scope: str = "auto",
+    output_mode: str = "single",
+    output_dir: Path = Path("output"),
+    environ: Mapping[str, str] | None = None,
+    dart_module: Any | None = None,
+) -> tuple[list[Path], str, str, str]:
+    """Run one-filing extraction and keep the original public return shape."""
+
+    dart = _configured_dart(environ=environ, dart_module=dart_module)
+    filing = _extract_filing(disclosure, scope=scope, dart=dart)
+    paths = export_statements(
+        filing.statements,
+        metadata=filing.metadata,
+        output_mode=output_mode,
+        output_dir=output_dir,
+    )
+
+    return (
+        paths,
+        filing.selected_scope,
+        filing.receipt_number,
+        filing.source,
+    )
+
+
+def run_many(
+    disclosure_input: str,
+    *,
+    scope: str = "auto",
+    output_mode: str = "single",
+    output_dir: Path = Path("output"),
+    environ: Mapping[str, str] | None = None,
+    dart_module: Any | None = None,
+) -> tuple[list[Path], list[FilingExtraction]]:
+    """Extract one or more filings, merging multiple years into one output."""
+
+    disclosures = parse_disclosure_inputs(disclosure_input)
+    dart = _configured_dart(environ=environ, dart_module=dart_module)
+    filings = [
+        _extract_filing(disclosure, scope=scope, dart=dart)
+        for disclosure in disclosures
+    ]
+
+    if len(filings) == 1:
+        statements = filings[0].statements
+        output_metadata = filings[0].metadata
+    else:
+        _validate_merge_compatibility(filings)
+        statements = merge_filing_statements(filings)
+        first_metadata = filings[0].metadata
+        output_metadata = FilingMetadata(
+            company_name=first_metadata.company_name,
+            report_type=first_metadata.report_type,
+            year_month=_merged_year_range(statements),
         )
 
-    return paths, selected_scope, receipt_number, source
+    paths = export_statements(
+        statements,
+        metadata=output_metadata,
+        output_mode=output_mode,
+        output_dir=output_dir,
+    )
+    return paths, filings
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -705,7 +996,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "XBRL이 없으면 공시 PDF를 사용합니다."
         )
     )
-    parser.add_argument("disclosure", help="DART 공시 URL 또는 14자리 접수번호")
+    parser.add_argument(
+        "disclosure",
+        help=(
+            "DART 공시 URL 또는 14자리 접수번호. 여러 연도는 쉼표 또는 줄바꿈으로 "
+            "구분합니다."
+        ),
+    )
     parser.add_argument(
         "--scope",
         choices=("auto", "consolidated", "separate"),
@@ -730,7 +1027,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     try:
-        paths, selected_scope, receipt_number, source = run(
+        paths, filings = run_many(
             args.disclosure,
             scope=args.scope,
             output_mode=args.output_mode,
@@ -744,9 +1041,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"오류: {exc}", file=sys.stderr)
         return 1
 
-    print(f"접수번호: {receipt_number}")
-    print(f"추출 원본: {source}")
-    print(f"재무제표 범위: {SCOPE_LABELS[selected_scope]}")
+    for filing in filings:
+        print(
+            f"접수번호: {filing.receipt_number} | "
+            f"추출 원본: {filing.source} | "
+            f"재무제표 범위: {SCOPE_LABELS[filing.selected_scope]}"
+        )
     for path in paths:
         print(f"생성 완료: {path}")
     return 0
