@@ -8,6 +8,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from extract_financials import (
+    FilingExtraction,
     FilingMetadata,
     FinancialExtractionError,
     MissingApiKeyError,
@@ -18,10 +19,13 @@ from extract_financials import (
     extract_statements,
     flatten_dataframe_columns,
     load_xbrl,
+    merge_statement_frames,
+    parse_disclosure_inputs,
     parse_filing_metadata_html,
     require_api_key,
     resolve_filing_metadata,
     run,
+    run_many,
     simplify_statement_dataframe,
 )
 
@@ -165,6 +169,29 @@ class FilingMetadataTests(unittest.TestCase):
 
         self.assertEqual(metadata.filename_stem, "펀진_사업보고서_2026.03")
         self.assertEqual(calls[0]["payload"], {"rcpNo": "20260331004320"})
+
+
+class MultipleDisclosureInputTests(unittest.TestCase):
+    def test_accepts_comma_and_newline_separated_disclosures(self):
+        disclosures = parse_disclosure_inputs(
+            "20240319000709,\n"
+            "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20250319000710"
+        )
+
+        self.assertEqual(
+            disclosures,
+            [
+                "20240319000709",
+                "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20250319000710",
+            ],
+        )
+
+    def test_duplicate_receipt_numbers_have_clear_error(self):
+        with self.assertRaisesRegex(FinancialExtractionError, "두 번"):
+            parse_disclosure_inputs(
+                "20240319000709,\n"
+                "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20240319000709"
+            )
 
 
 class XbrlLoadingTests(unittest.TestCase):
@@ -387,6 +414,188 @@ class ExcelOutputTests(unittest.TestCase):
                 )
                 workbook = load_workbook(path)
                 self.assertEqual(workbook.sheetnames, [statement_name])
+
+
+class MultiYearMergeTests(unittest.TestCase):
+    def test_merges_by_conservative_item_identity_and_uses_latest_overlap(self):
+        old_frame = pd.DataFrame(
+            [
+                ["Ⅰ. 유동자산", 100, 90],
+                ["1. 현금 (주석 3)", 30, 20],
+                ["2. 매출채권", 70, 70],
+            ],
+            columns=["항목", "2024-12-31", "2023-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["유동자산", 130, 110],
+                ["1. 현금및현금성자산 (주석 4)", 40, 35],
+                ["2. 계약자산", 10, 5],
+                ["3. 매출채권", 80, 75],
+            ],
+            columns=["항목", "2025-12-31", "2024-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (FilingMetadata("테스트", "사업보고서", "2025.03"), old_frame),
+                (FilingMetadata("테스트", "사업보고서", "2026.03"), new_frame),
+            ]
+        )
+
+        self.assertEqual(
+            merged.columns.to_list(),
+            ["항목", "2025-12-31", "2024-12-31", "2023-12-31"],
+        )
+        receivables = merged[merged["항목"] == "3. 매출채권"]
+        self.assertEqual(len(receivables), 1)
+        self.assertEqual(receivables.iloc[0]["2024-12-31"], 75)
+        self.assertEqual(receivables.iloc[0]["2023-12-31"], 70)
+
+        self.assertIn("1. 현금 (주석 3)", merged["항목"].to_list())
+        self.assertIn("1. 현금및현금성자산 (주석 4)", merged["항목"].to_list())
+        old_cash = merged[merged["항목"] == "1. 현금 (주석 3)"].iloc[0]
+        new_cash = merged[
+            merged["항목"] == "1. 현금및현금성자산 (주석 4)"
+        ].iloc[0]
+        self.assertEqual(old_cash["2023-12-31"], 20)
+        self.assertEqual(old_cash["2024-12-31"], "")
+        self.assertEqual(new_cash["2024-12-31"], 35)
+        self.assertEqual(new_cash["2023-12-31"], "")
+
+    def test_note_reference_change_does_not_create_duplicate_row(self):
+        old_frame = pd.DataFrame(
+            [["1. 현금및현금성자산 (주석 3)", 30]],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [["현금및현금성자산 (주석 4)", 40]],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (FilingMetadata("테스트", "사업보고서", "2025.03"), old_frame),
+                (FilingMetadata("테스트", "사업보고서", "2026.03"), new_frame),
+            ]
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged.iloc[0]["2025-12-31"], 40)
+        self.assertEqual(merged.iloc[0]["2024-12-31"], 30)
+
+    def test_run_many_creates_one_multi_year_workbook(self):
+        def filing(receipt, year_month, current_year, prior_year):
+            statements = {
+                name: pd.DataFrame(
+                    [["자산", current_year, prior_year]],
+                    columns=[
+                        "항목",
+                        f"{current_year}-12-31",
+                        f"{prior_year}-12-31",
+                    ],
+                )
+                for name in STATEMENT_NAMES
+            }
+            return FilingExtraction(
+                metadata=FilingMetadata("테스트 주식회사", "사업보고서", year_month),
+                statements=statements,
+                selected_scope="consolidated",
+                receipt_number=receipt,
+                source="XBRL",
+            )
+
+        extractions = [
+            filing("20240319000709", "2024.03", 2023, 2022),
+            filing("20250319000710", "2025.03", 2024, 2023),
+        ]
+        dart = SimpleNamespace(set_api_key=lambda **kwargs: None)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch(
+                "extract_financials._extract_filing",
+                side_effect=extractions,
+            ):
+                paths, returned_filings = run_many(
+                    "20240319000709,\n20250319000710",
+                    output_dir=Path(temp_dir),
+                    environ={"DART_API_KEY": "secret"},
+                    dart_module=dart,
+                )
+
+            self.assertEqual(len(returned_filings), 2)
+            self.assertEqual(
+                paths[0].name,
+                "테스트 주식회사_사업보고서_2022-2024.xlsx",
+            )
+            workbook = load_workbook(paths[0])
+            self.assertEqual(workbook.sheetnames, list(STATEMENT_NAMES))
+            self.assertEqual(
+                [cell.value for cell in workbook["재무상태표"][1]],
+                ["항목", "2024-12-31", "2023-12-31", "2022-12-31"],
+            )
+
+    def test_run_many_rejects_different_companies(self):
+        frame = pd.DataFrame([["자산", 1]], columns=["항목", "2025-12-31"])
+        statements = {name: frame for name in STATEMENT_NAMES}
+        extractions = [
+            FilingExtraction(
+                FilingMetadata("회사 A", "사업보고서", "2025.03"),
+                statements,
+                "consolidated",
+                "20240319000709",
+                "XBRL",
+            ),
+            FilingExtraction(
+                FilingMetadata("회사 B", "사업보고서", "2026.03"),
+                statements,
+                "consolidated",
+                "20250319000710",
+                "XBRL",
+            ),
+        ]
+        dart = SimpleNamespace(set_api_key=lambda **kwargs: None)
+
+        with (
+            patch("extract_financials._extract_filing", side_effect=extractions),
+            self.assertRaisesRegex(FinancialExtractionError, "같은 회사"),
+        ):
+            run_many(
+                "20240319000709,20250319000710",
+                environ={"DART_API_KEY": "secret"},
+                dart_module=dart,
+            )
+
+    def test_run_many_rejects_mixed_scopes(self):
+        frame = pd.DataFrame([["자산", 1]], columns=["항목", "2025-12-31"])
+        statements = {name: frame for name in STATEMENT_NAMES}
+        extractions = [
+            FilingExtraction(
+                FilingMetadata("같은 회사", "사업보고서", "2025.03"),
+                statements,
+                "consolidated",
+                "20240319000709",
+                "XBRL",
+            ),
+            FilingExtraction(
+                FilingMetadata("같은 회사", "사업보고서", "2026.03"),
+                statements,
+                "separate",
+                "20250319000710",
+                "PDF",
+            ),
+        ]
+        dart = SimpleNamespace(set_api_key=lambda **kwargs: None)
+
+        with (
+            patch("extract_financials._extract_filing", side_effect=extractions),
+            self.assertRaisesRegex(FinancialExtractionError, "섞을 수 없습니다"),
+        ):
+            run_many(
+                "20240319000709,20250319000710",
+                environ={"DART_API_KEY": "secret"},
+                dart_module=dart,
+            )
 
 
 class PipelineFallbackTests(unittest.TestCase):
