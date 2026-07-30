@@ -118,6 +118,16 @@ class FilingMetadataTests(unittest.TestCase):
             "테스트 회사_반기보고서_2025.08",
         )
 
+    def test_parses_audit_report_title_with_year_and_month_only(self):
+        metadata = parse_filing_metadata_html(
+            "<title>[넥슨] 감사보고서(2025.12)</title>"
+        )
+
+        self.assertEqual(metadata.company_name, "넥슨")
+        self.assertEqual(metadata.report_type, "감사보고서")
+        self.assertEqual(metadata.year_month, "2025.12")
+        self.assertEqual(metadata.filename_stem, "넥슨_감사보고서_2025.12")
+
     def test_invalid_filename_characters_are_replaced(self):
         metadata = FilingMetadata(
             company_name="테스트:회사",
@@ -412,9 +422,9 @@ class PipelineFallbackTests(unittest.TestCase):
                 patch(
                     "extract_financials.resolve_filing_metadata",
                     return_value=FilingMetadata(
-                        "펀진",
-                        "사업보고서",
-                        "2026.03",
+                        "넥슨",
+                        "감사보고서",
+                        "2026.05",
                     ),
                 ),
             ):
@@ -429,7 +439,7 @@ class PipelineFallbackTests(unittest.TestCase):
         self.assertEqual(selected_scope, "consolidated")
         self.assertEqual(receipt_number, "20260317801285")
         self.assertEqual(source, "PDF")
-        self.assertEqual(paths[0].name, "펀진_사업보고서_2026.03.xlsx")
+        self.assertEqual(paths[0].name, "넥슨_감사보고서_2026.05.xlsx")
 
 
 if __name__ == "__main__":
