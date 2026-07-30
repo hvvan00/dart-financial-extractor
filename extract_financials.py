@@ -1066,6 +1066,47 @@ def _reconcile_duplicate_rows(
     ]
 
 
+def _fill_missing_semantic_parent_totals(
+    rows: list[dict[str, Any]],
+    ordered_periods: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Fill missing revenue/cost totals from unique direct detail accounts."""
+
+    for parent_key in ("매출액", "매출원가"):
+        parent_rows = [row for row in rows if row["key"] == parent_key]
+        child_rows = [
+            row for row in rows if _semantic_parent_key(str(row["key"])) == parent_key
+        ]
+        if len(parent_rows) != 1 or not child_rows:
+            continue
+
+        parent = parent_rows[0]
+        for period in ordered_periods:
+            if not _is_blank_cell(parent["values"].get(period, "")):
+                continue
+
+            populated_children = [
+                (str(row["key"]), row["values"].get(period, ""))
+                for row in child_rows
+                if not _is_blank_cell(row["values"].get(period, ""))
+            ]
+            child_keys = [key for key, _ in populated_children]
+            if not child_keys or len(child_keys) != len(set(child_keys)):
+                continue
+
+            amounts: list[numbers.Number] = []
+            for _, value in populated_children:
+                if not isinstance(value, numbers.Number) or isinstance(value, bool):
+                    break
+                if isinstance(value, float) and not math.isfinite(value):
+                    break
+                amounts.append(value)
+            else:
+                parent["values"][period] = sum(amounts)
+
+    return rows
+
+
 def _period_dates(header: str) -> list[str]:
     dates = [
         f"{year}-{int(month):02d}-{int(day):02d}"
@@ -1306,6 +1347,7 @@ def merge_statement_frames(
 
     ordered_periods = sorted(period_headers, key=_period_sort_key, reverse=True)
     rows = _reconcile_duplicate_rows(rows, ordered_periods)
+    rows = _fill_missing_semantic_parent_totals(rows, ordered_periods)
     output_rows = [
         [row["label"]] + [row["values"].get(period, "") for period in ordered_periods]
         for row in rows

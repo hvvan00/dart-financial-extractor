@@ -33,7 +33,9 @@
   within the same section and when their populated periods do not overlap.
   Infer the `매출액` or `매출원가` parent for unambiguous revenue/cost detail
   labels when an older PDF omits the visible parent row, while keeping the
-  total row separate from its details.
+  total row separate from its details. Fill a blank parent-period amount from
+  unique numeric direct details, but never overwrite a disclosed total or
+  calculate when duplicate detail keys could cause double counting.
   Repeated contra/subsidy labels must also have the same immediate parent.
   Keep genuinely renamed items separate.
 - Each exported statement must contain only one Korean `항목` column followed
