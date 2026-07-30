@@ -40,7 +40,7 @@ SCOPE_LABELS = {
     "consolidated": "연결",
     "separate": "별도",
 }
-REPORT_TYPES = ("사업보고서", "반기보고서", "분기보고서")
+REPORT_TYPES = ("사업보고서", "반기보고서", "분기보고서", "감사보고서")
 _INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
@@ -99,7 +99,8 @@ def parse_filing_metadata_html(html_text: str) -> FilingMetadata:
     report_pattern = "|".join(REPORT_TYPES)
     date_pattern = (
         r"(?P<year>(?:19|20)\d{2})[.\-/년]\s*"
-        r"(?P<month>\d{1,2})[.\-/월]\s*(?:\d{1,2}일?)?"
+        r"(?P<month>\d{1,2})"
+        r"(?:[.\-/월]\s*(?:\d{1,2}일?)?)?"
     )
     patterns = (
         re.compile(
