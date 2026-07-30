@@ -790,6 +790,16 @@ _REPEAT_SENSITIVE_ITEM_KEYS = {
     "감가상각누계액",
     "정부보조금",
 }
+_BALANCE_SHEET_CHILD_ITEM_KEYS = {
+    *_REPEAT_SENSITIVE_ITEM_KEYS,
+    "사채할인발행차금",
+}
+_CASH_FLOW_SUBGROUP_ITEM_KEYS = {
+    "당기순손익",
+    "현금의유출이없는비용등의가산",
+    "현금의유입이없는수익등의차감",
+    "영업활동으로인한자산부채의변동",
+}
 _CORE_SECTION_KEYS = {"자산", "부채", "자본"}
 _SEMANTIC_SECTION_KEYS = {
     "유동자산",
@@ -869,6 +879,33 @@ def _explicit_hierarchy_level(value: Any) -> int | None:
     if _KOREAN_ITEM_PATTERN.match(label):
         return 4
     return None
+
+
+def _display_item_label(value: Any, *, is_child: bool = False) -> str:
+    """Remove inconsistent source numbering and mark true child accounts."""
+
+    label = _clean_item_value(value)
+    previous = None
+    while label != previous:
+        previous = label
+        label = _LEADING_ITEM_NUMBER_PATTERN.sub("", label)
+    label = re.sub(r"\s+", " ", label).strip()
+    return f"└ {label}" if is_child and label else label
+
+
+def _is_semantic_subgroup(statement_name: str, value: Any) -> bool:
+    """Normalize subgroup roles that source numbering expresses inconsistently."""
+
+    key = re.sub(r"[·ㆍ・]", "", _normalized_item_key(value))
+    if statement_name == "손익계산서":
+        return key != "매출원가" and key.endswith("매출원가")
+    if statement_name == "현금흐름표":
+        return (
+            key in _CASH_FLOW_SUBGROUP_ITEM_KEYS
+            or key.endswith("활동으로인한현금유입액")
+            or key.endswith("활동으로인한현금유출액")
+        )
+    return False
 
 
 def _row_identity_tokens(labels: Sequence[Any]) -> list[tuple[str, ...]]:
@@ -1337,7 +1374,8 @@ def format_worksheet(worksheet: Any) -> None:
             wrap_text=True,
         )
 
-    current_explicit_indent = 0
+    active_subgroup = False
+    current_detail_indent = 1
     for row in worksheet.iter_rows(min_row=2):
         has_number = False
         label = _clean_item_value(row[0].value)
@@ -1345,22 +1383,38 @@ def format_worksheet(worksheet: Any) -> None:
         hierarchy_level = _explicit_hierarchy_level(label)
         is_core_section = compact_label in _CORE_SECTION_KEYS
         is_total = "총계" in compact_label or compact_label.endswith("합계")
+        is_subgroup = hierarchy_level == 2 or _is_semantic_subgroup(
+            worksheet.title,
+            label,
+        )
+        is_child_item = (
+            worksheet.title == "재무상태표"
+            and _normalized_item_key(label) in _BALANCE_SHEET_CHILD_ITEM_KEYS
+            and hierarchy_level is None
+        )
 
         if hierarchy_level == 0:
-            current_explicit_indent = 0
+            active_subgroup = False
+            current_detail_indent = 1
+            row_indent = 0
+        elif is_subgroup:
+            active_subgroup = True
+            current_detail_indent = 2
+            row_indent = 1
         elif hierarchy_level == 1:
-            current_explicit_indent = 0
-        elif hierarchy_level == 2:
-            current_explicit_indent = 1
+            active_subgroup = False
+            current_detail_indent = 1
+            row_indent = 0
         elif hierarchy_level == 3:
-            current_explicit_indent = 2
+            row_indent = 2 if active_subgroup else 1
+            current_detail_indent = row_indent
         elif hierarchy_level == 4:
-            current_explicit_indent = 3
-        row_indent = (
-            current_explicit_indent
-            if hierarchy_level is not None
-            else min(current_explicit_indent + 1, 3)
-        )
+            row_indent = 2 if active_subgroup else min(current_detail_indent + 1, 3)
+            current_detail_indent = row_indent
+        elif is_child_item:
+            row_indent = min(current_detail_indent + 1, 3)
+        else:
+            row_indent = current_detail_indent
 
         for cell in row:
             value = cell.value
@@ -1381,15 +1435,15 @@ def format_worksheet(worksheet: Any) -> None:
                 cell.fill = major_fill
                 cell.font = white_bold_font
                 cell.border = Border(top=medium_teal, bottom=medium_teal)
+        elif is_subgroup:
+            for cell in row:
+                cell.fill = subgroup_fill
+                cell.font = white_bold_font
         elif hierarchy_level == 1:
             for cell in row:
                 cell.fill = section_fill
                 cell.font = white_bold_font
                 cell.border = Border(top=thin_teal, bottom=thin_teal)
-        elif hierarchy_level == 2:
-            for cell in row:
-                cell.fill = subgroup_fill
-                cell.font = white_bold_font
         elif is_total:
             for cell in row:
                 cell.font = bold_font
@@ -1397,13 +1451,15 @@ def format_worksheet(worksheet: Any) -> None:
         elif not has_number and row[0].value:
             row[0].font = bold_font
 
-        if is_core_section or hierarchy_level in {1, 2}:
+        if is_core_section or hierarchy_level == 1 or is_subgroup:
             for cell in row[1:]:
                 if isinstance(cell.value, numbers.Number) and not isinstance(
                     cell.value,
                     bool,
                 ):
                     cell.number_format = "#,##0;(#,##0);-"
+
+        row[0].value = _display_item_label(label, is_child=is_child_item)
 
     for column_index, column_cells in enumerate(worksheet.columns, start=1):
         content_width = max((_display_width(cell.value) for cell in column_cells), default=0)
