@@ -817,6 +817,7 @@ class MultiYearMergeTests(unittest.TestCase):
         )
         product = merged.iloc[1]
         goods = merged.iloc[2]
+        revenue = merged.iloc[0]
         self.assertEqual(
             [
                 product[year]
@@ -833,6 +834,10 @@ class MultiYearMergeTests(unittest.TestCase):
         self.assertEqual(goods["2024-12-31"], "")
         self.assertEqual(goods["2023-12-31"], 141_028_811)
         self.assertEqual(goods["2022-12-31"], 315_258_041)
+        self.assertEqual(revenue["2025-12-31"], 24_249_766_099)
+        self.assertEqual(revenue["2024-12-31"], 16_582_300_361)
+        self.assertEqual(revenue["2023-12-31"], 11_775_173_441)
+        self.assertEqual(revenue["2022-12-31"], 14_669_028_629)
 
     def test_normalizes_other_revenue_detail_amount_suffixes(self):
         old_frame = pd.DataFrame(
@@ -864,6 +869,64 @@ class MultiYearMergeTests(unittest.TestCase):
         self.assertEqual(len(service), 1)
         self.assertEqual(service.iloc[0]["2025-12-31"], 110)
         self.assertEqual(service.iloc[0]["2024-12-31"], 90)
+
+    def test_fills_missing_cost_of_sales_total_from_unique_direct_details(self):
+        old_frame = pd.DataFrame(
+            [
+                ["Ⅱ.매출원가", ""],
+                ["1. 제품매출원가", 80],
+                ["2. 상품매출원가", 20],
+            ],
+            columns=["항목", "2024-12-31"],
+        )
+        new_frame = pd.DataFrame(
+            [
+                ["Ⅱ.매출원가", 120],
+                ["1. 제품매출원가", 95],
+                ["2. 상품매출원가", 25],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (
+                    FilingMetadata("테스트", "감사보고서", "2025.03"),
+                    old_frame,
+                ),
+                (
+                    FilingMetadata("테스트", "감사보고서", "2026.03"),
+                    new_frame,
+                ),
+            ]
+        )
+
+        cost_of_sales = merged[merged["항목"] == "Ⅱ.매출원가"].iloc[0]
+        self.assertEqual(cost_of_sales["2025-12-31"], 120)
+        self.assertEqual(cost_of_sales["2024-12-31"], 100)
+
+    def test_does_not_fill_parent_total_when_detail_keys_overlap(self):
+        frame = pd.DataFrame(
+            [
+                ["Ⅰ.매출액", ""],
+                ["1. 제품매출", 60],
+                ["제품매출액", 60],
+                ["2. 상품매출", 40],
+            ],
+            columns=["항목", "2025-12-31"],
+        )
+
+        merged = merge_statement_frames(
+            [
+                (
+                    FilingMetadata("테스트", "감사보고서", "2026.03"),
+                    frame,
+                )
+            ]
+        )
+
+        revenue = merged[merged["항목"] == "Ⅰ.매출액"].iloc[0]
+        self.assertEqual(revenue["2025-12-31"], "")
 
     def test_merges_government_subsidy_only_under_the_same_parent(self):
         old_frame = pd.DataFrame(
